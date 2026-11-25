@@ -750,6 +750,7 @@ function QualityDetails({ quality, operations }: { quality: QualitySummary | nul
   if (operations.error) return <section aria-label="Качество и операции"><h4>Качество и операции</h4><p role="status">Журнал операций 1С недоступен: {operations.error}</p></section>;
   if (!quality || quality.entries.length === 0) return <section aria-label="Качество и операции"><h4>Качество и операции</h4><p>Журнал операций пуст.</p></section>;
   const test = quality.latestTest;
+  const load = quality.latestLoad;
   return <section aria-label="Качество и операции">
     <h4>Качество и операции</h4>
     {test ? <div className="dashboard-quality">
@@ -771,7 +772,11 @@ function QualityDetails({ quality, operations }: { quality: QualitySummary | nul
     </div> : <p>Результатов тестов и проверок нет.</p>}
     {!test && <p className="dashboard-note">Диагностика BSL LS и АПК: публичного контракта отчёта с ревизией пока нет.</p>}
     {quality.latestBuild && <p>Последняя сборка: {operationActionLabels[quality.latestBuild.action] ?? quality.latestBuild.action} · {operationStateLabels[quality.latestBuild.state] ?? quality.latestBuild.state} · {new Date(quality.latestBuild.finishedAt ?? quality.latestBuild.startedAt).toLocaleString("ru-RU")}</p>}
-    {quality.latestLoad && <p>Последняя загрузка: {operationActionLabels[quality.latestLoad.action] ?? quality.latestLoad.action} · профиль {quality.latestLoad.profile} · ревизия {quality.latestLoad.revision ?? "нет данных"}</p>}
+    {load && <p>
+      Последняя загрузка: {operationActionLabels[load.action] ?? load.action} · профиль {load.profile} · {operationStateLabels[load.state] ?? load.state}
+      {quality.confirmedLoadRevision ? ` · ревизия по журналу ${quality.confirmedLoadRevision}` : " · ревизия базы не подтверждена"}
+      {load.needsInspection ? " · требуется проверка состояния базы" : ""}
+    </p>}
     {quality.revisionMismatch && <p className="dashboard-warning" role="status">Исходники разошлись с базой: загружена ревизия {quality.revisionMismatch.loaded}, текущая {quality.revisionMismatch.source}.</p>}
     <UrlLink href="/plugins/1c-properties/projects">Открыть операции 1С</UrlLink>
   </section>;

@@ -50,6 +50,7 @@ export interface QualitySummary {
   testStaleReason: string | null;
   latestBuild: OperationEntry | null;
   latestLoad: OperationEntry | null;
+  confirmedLoadRevision: string | null;
   revisionMismatch: { loaded: string; source: string; at: number; action: string } | null;
 }
 
@@ -127,9 +128,12 @@ export function summarizeQuality(
   }
 
   const latestBuild = ordered.find((entry) => isBuildAction(entry.action) && (entry.state === "done" || entry.state === "failed")) ?? null;
-  const latestLoad = ordered.find((entry) => isLoadAction(entry.action) && entry.revision && (entry.state === "done" || entry.state === "failed")) ?? null;
-  const mismatch = latestLoad && options.sourceRevision && latestLoad.revision !== options.sourceRevision
-    ? { loaded: latestLoad.revision!, source: options.sourceRevision, at: finishedAt(latestLoad) ?? Date.parse(latestLoad.startedAt), action: latestLoad.action }
+  const latestLoad = ordered.find((entry) => isLoadAction(entry.action)) ?? null;
+  const confirmedLoadRevision = latestLoad?.state === "done" && !latestLoad.needsInspection
+    ? latestLoad.revision
+    : null;
+  const mismatch = latestLoad && confirmedLoadRevision && options.sourceRevision && confirmedLoadRevision !== options.sourceRevision
+    ? { loaded: confirmedLoadRevision, source: options.sourceRevision, at: finishedAt(latestLoad) ?? Date.parse(latestLoad.startedAt), action: latestLoad.action }
     : null;
 
   return {
@@ -141,6 +145,7 @@ export function summarizeQuality(
     testStaleReason,
     latestBuild,
     latestLoad,
+    confirmedLoadRevision,
     revisionMismatch: mismatch,
   };
 }

@@ -284,6 +284,43 @@ test("свежесть отчёта, сравнение прогонов и ра
   assert.equal(stale.testDelta, null);
 });
 
+test("после неудачной загрузки состояние базы остаётся неподтверждённым", () => {
+  const successful = operation({ id: "confirmed", action: "load-xml", revision: "rev-1" });
+  const failed = operation({
+    id: "failed", action: "load-xml", state: "failed", revision: "rev-2", needsInspection: true,
+    startedAt: "2026-11-21T10:00:00Z", finishedAt: "2026-11-21T10:05:00Z",
+  });
+  for (const entries of [[failed], [successful, failed]]) {
+    const summary = summarizeQuality(entries, { sourceRevision: "rev-3" });
+    assert.equal(summary.latestLoad?.id, "failed");
+    assert.equal(summary.revisionMismatch, null);
+    assert.equal(summary.confirmedLoadRevision, null);
+  }
+
+  const recovered = operation({
+    ...failed, id: "recovered", state: "done", revision: "rev-3", needsInspection: false,
+    startedAt: "2026-11-22T10:00:00Z", finishedAt: "2026-11-22T10:05:00Z",
+  });
+  const summary = summarizeQuality([successful, failed, recovered], { sourceRevision: "rev-4" });
+  assert.equal(summary.confirmedLoadRevision, "rev-3");
+  assert.equal(summary.revisionMismatch?.loaded, "rev-3");
+});
+
+test("загрузка без подтверждения или записанной ревизии не даёт расхождения", () => {
+  for (const load of [
+    operation({ id: "cancelled", action: "load-xml", state: "cancelled" }),
+    operation({ id: "running", action: "load-xml", state: "running", finishedAt: null }),
+    operation({ id: "interrupted", action: "load-xml", state: "interrupted", needsInspection: true }),
+    operation({ id: "inspection", action: "load-xml", needsInspection: true }),
+    operation({ id: "unknown-revision", action: "load-xml", revision: null }),
+  ]) {
+    const summary = summarizeQuality([load], { sourceRevision: "rev-2" });
+    assert.equal(summary.latestLoad?.id, load.id);
+    assert.equal(summary.confirmedLoadRevision, null);
+    assert.equal(summary.revisionMismatch, null);
+  }
+});
+
 test("сводка OpenSpec считает блокировки и блокеры BSL Flow", () => {
   const summary = summarizeOpenSpec({
     changes: [

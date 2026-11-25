@@ -28,6 +28,10 @@ const measurementSchema = z.object({
         usedPercent: z.number().nonnegative(),
         resetsAt: z.iso.datetime({ offset: true }).nullable(),
         model: z.string().nullable(),
+        cost: z.object({
+          usedUsdCents: z.number().nonnegative(),
+          limitUsdCents: z.number().positive(),
+        }).nullable().optional(),
       })),
     }),
     z.object({ status: z.enum(["not_installed", "unauthenticated", "expired", "error"]) }),
@@ -79,29 +83,36 @@ export function remainingQuota(usedPercent: number) {
   return Math.max(0, 100 - usedPercent);
 }
 
-export async function readProviderQuotas(sdk: Sdk, providerId: string, hostId: string | null, signal: AbortSignal) {
-  if (!hostId) return [];
+export function remainingBudgetUsd(cost: { usedUsdCents: number; limitUsdCents: number }) {
+  return Math.max(0, cost.limitUsdCents - cost.usedUsdCents) / 100;
+}
+
+export async function readProviderQuotas(
+  sdk: Sdk, providerId: string, hostId: string | null, signal: AbortSignal, refresh = false,
+) {
   const sources = await sdk.plugins.experimental_discoverRpc({ method: listMethod, signal });
   const results = await Promise.allSettled(sources.map(async (source) => {
     const { resources } = await sdk.plugins.callRpc({
       pluginId: source.pluginId, method: listMethod, input: {}, outputSchema: inventorySchema, signal,
     });
-    const matches = resources.filter((resource) =>
-      resource.providerId === providerId && resource.scope.kind === "host" && resource.scope.hostId === hostId);
+    const matches = resources.filter(({ scope }) => scope.kind === "shared" || scope.hostId === hostId);
     return Promise.all(matches.map(async (resource) => {
       const measurement = await sdk.plugins.callRpc({
-        pluginId: source.pluginId, method: getMethod, input: { resourceId: resource.id, refresh: false }, outputSchema: measurementSchema, signal,
+        pluginId: source.pluginId, method: getMethod, input: { resourceId: resource.id, refresh }, outputSchema: measurementSchema, signal,
       }).catch(() => null);
       const sameAccount = measurement?.accountKey === resource.accountKey;
       return {
         id: `${source.pluginId}:${resource.id}`,
         label: resource.label,
+        providerId: resource.providerId,
+        shared: resource.scope.kind === "shared",
         source: source.displayName,
         measurement: sameAccount ? measurement : null,
       };
     }));
   }));
-  return results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  return results.flatMap((result) => result.status === "fulfilled" ? result.value : [])
+    .sort((a, b) => Number(b.providerId === providerId) - Number(a.providerId === providerId));
 }
 
 export async function readThreadTelemetry(sdk: Sdk, threadId: string, providerId: string, signal: AbortSignal) {

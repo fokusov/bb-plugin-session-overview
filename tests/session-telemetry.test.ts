@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isQuotaStale, readMcpInventory, readProviderQuotas, readThreadTelemetry, remainingQuota } from "../lib/session-telemetry.ts";
+import { isQuotaStale, readMcpInventory, readProviderQuotas, readThreadTelemetry, remainingBudgetUsd, remainingQuota } from "../lib/session-telemetry.ts";
 
 const signal = new AbortController().signal;
 
@@ -36,7 +36,7 @@ test("показывает последнее подтверждённое со�
   ]);
 });
 
-test("запрашивает только квоту провайдера на совпадающей машине и отклоняет сменившийся аккаунт", async () => {
+test("запрашивает квоту на совпадающей машине и отклоняет сменившийся аккаунт", async () => {
   const requests: string[] = [];
   const source = { pluginId: "test-provider", displayName: "Provider" };
   const sdk = {
@@ -46,8 +46,6 @@ test("запрашивает только квоту провайдера на �
         if (method.endsWith("listResources")) return { resources: [
           { id: "first", accountKey: "a", providerId: "codex", scope: { kind: "host", hostId: "local" } },
           { id: "second", accountKey: "a", providerId: "codex", scope: { kind: "host", hostId: "elsewhere" } },
-          { id: "third", accountKey: "a", providerId: "opencode2", scope: { kind: "host", hostId: "local" } },
-          { id: "shared", accountKey: "a", providerId: "codex", scope: { kind: "shared" } },
         ] };
         assert.equal(input.refresh, false);
         requests.push(input.resourceId);
@@ -67,6 +65,48 @@ test("отмечает просроченное окно, старый заме�
   assert.equal(isQuotaStale(1, null, 900_001), true);
   assert.equal(remainingQuota(32.5), 67.5);
   assert.equal(remainingQuota(104), 0);
+});
+
+test("читает бюджеты других провайдеров на этой машине и общие бюджеты, не подставляя валюту в квоты", async () => {
+  const requested: string[] = [];
+  const resource = (id: string, providerId: string, scope: object) => ({ id, providerId, scope, label: id, accountKey: id });
+  const sdk = {
+    plugins: {
+      experimental_discoverRpc: async () => [{ pluginId: "usage", displayName: "Usage" }],
+      callRpc: async ({ input, method, outputSchema }: {
+        input: { resourceId: string; refresh: boolean };
+        method: string;
+        outputSchema: { parse(value: unknown): unknown };
+      }) => {
+        if (method.endsWith("listResources")) return outputSchema.parse({ resources: [
+          resource("extra", "acp-cursor", { kind: "host", hostId: "local" }),
+          resource("remote", "acp-cursor", { kind: "host", hostId: "other" }),
+          resource("pool", "codex", { kind: "shared" }),
+          resource("current", "codex", { kind: "host", hostId: "local" }),
+        ] });
+        assert.equal(input.refresh, true);
+        requested.push(input.resourceId);
+        return outputSchema.parse({
+          accountKey: input.resourceId, observedAt: 100,
+          usage: { status: "ok", windows: [{
+            id: "window", label: "Окно", model: null, usedPercent: 25, resetsAt: null,
+            cost: input.resourceId === "extra" ? { limitUsdCents: 2500, usedUsdCents: 925 } : null,
+          }] },
+        });
+      },
+    },
+  } as unknown as Parameters<typeof readProviderQuotas>[0];
+  const rows = await readProviderQuotas(sdk, "codex", "local", signal, true);
+  assert.deepEqual(requested.sort(), ["current", "extra", "pool"]);
+  assert.deepEqual(rows.map(({ providerId, shared }) => [providerId, shared]), [
+    ["codex", true], ["codex", false], ["acp-cursor", false],
+  ]);
+  const quota = rows[0].measurement?.usage;
+  const budget = rows[2].measurement?.usage;
+  assert.equal(quota?.status === "ok" && quota.windows[0].cost, null);
+  assert.deepEqual(budget?.status === "ok" && budget.windows[0].cost, { limitUsdCents: 2500, usedUsdCents: 925 });
+  assert.equal(remainingBudgetUsd({ limitUsdCents: 2500, usedUsdCents: 925 }), 15.75);
+  assert.equal(remainingBudgetUsd({ limitUsdCents: 2500, usedUsdCents: 2510 }), 0);
 });
 
 test("показывает отключённый MCP только в конфигурации нужной машины и провайдера", async () => {

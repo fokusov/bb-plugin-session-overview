@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { UrlLink, useSdk } from "@get-bb/plugin-sdk/app";
-import { isQuotaStale, readMcpInventory, readProviderQuotas, readThreadTelemetry, remainingQuota } from "./lib/session-telemetry.js";
+import { experimental_useProviders, UrlLink, useSdk } from "@get-bb/plugin-sdk/app";
+import { isQuotaStale, readMcpInventory, readProviderQuotas, readThreadTelemetry, remainingBudgetUsd, remainingQuota } from "./lib/session-telemetry.js";
+import { moneyLabel, percentLabel, SessionMeter, SessionRow } from "./session-rows.js";
 
 type Quotas = Awaited<ReturnType<typeof readProviderQuotas>>;
 type Telemetry = Awaited<ReturnType<typeof readThreadTelemetry>>;
@@ -17,35 +18,58 @@ function time(value: number | string): string {
   return new Date(value).toLocaleString();
 }
 
-function QuotaSection({ quotas, telemetry, now }: { quotas: Quotas | null | undefined; telemetry: Telemetry | null; now: number }) {
+function QuotaSection({ quotas, telemetry, now, refresh, refreshing }: {
+  quotas: Quotas | null | undefined; telemetry: Telemetry | null; now: number;
+  refresh: () => void; refreshing: boolean;
+}) {
+  const { providers } = experimental_useProviders();
   const limits = telemetry?.limits;
   const cost = telemetry?.cost;
-  return <section className="session-section" aria-label="Квоты и стоимость">
-    <h3>Квоты и стоимость</h3>
-    {limits && <>
-      <p>Эта сессия: {limitStatus[limits.status]} · {time(limits.at)}{isQuotaStale(limits.at, null, now) ? " · замер устарел" : ""}</p>
-      {limits.windows.length > 0 && <ul>{limits.windows.map((row, index) => <li key={row.providerKey ?? index}>
-        {row.label ?? "Окно квоты"} · {limitStatus[row.status]}
-        {row.resetsAtMs !== null ? ` · сброс ${time(row.resetsAtMs)}` : ""}
-        {isQuotaStale(limits.at, row.resetsAtMs, now) ? " · замер устарел" : ""}
-      </li>)}</ul>}
-    </>}
-    {quotas?.map(({ id, label, measurement, source }) => <div key={id}>
-      <p>{label} · квота ресурса на машине · {source}</p>
-      {measurement?.usage.status === "ok" && measurement.observedAt !== null ? <>
-        <small>Замер {time(measurement.observedAt)}</small>
-        <ul>{measurement.usage.windows.map((row) => <li key={row.id}>
-          {row.label}{row.model ? ` · ${row.model}` : ""} · остаток {remainingQuota(row.usedPercent).toLocaleString(undefined, { maximumFractionDigits: 1 })}%
-          {row.resetsAt ? ` · сброс ${time(row.resetsAt)}` : ""}
-          {isQuotaStale(measurement.observedAt, row.resetsAt ? Date.parse(row.resetsAt) : null, now) ? " · замер устарел" : ""}
-        </li>)}</ul>
-      </> : <p>Замер ресурса недоступен.</p>}
-    </div>)}
-    {!limits && !quotas?.length && <p>{quotas === undefined ? "Загрузка квот…" : "Данные о квотах недоступны."}</p>}
-    {cost
-      ? <p>Стоимость по отчёту провайдера: {cost.amount} {cost.currency}{cost.estimated ? " · оценка" : ""} · {time(cost.at)}</p>
-      : <p>Стоимость сессии недоступна.</p>}
-    <UrlLink href="/plugins/usage-page/usage">История расходов в Usage</UrlLink>
+  return <section className="session-section" aria-label="Расход и баланс">
+    <div className="session-heading">
+      <h3>Расход и баланс</h3>
+      <button type="button" onClick={refresh} disabled={refreshing} aria-label="Обновить квоты и баланс">{refreshing ? "Обновляю…" : "Обновить"}</button>
+    </div>
+    {quotas?.map(({ id, label, providerId, shared, measurement, source }) => {
+      const sample = measurement?.usage.status === "ok" && measurement.observedAt !== null
+        ? { windows: measurement.usage.windows, at: measurement.observedAt } : null;
+      const providerName = providers.find(({ id }) => id === providerId)?.displayName ?? providerId;
+      return <div className="session-usage-resource" key={id}>
+        <SessionRow label={<strong>{providerName}</strong>}>
+          <span title={source}>{shared ? "Общий аккаунт" : label}</span>
+        </SessionRow>
+        {sample?.windows.map((row) => {
+          const remaining = remainingQuota(row.usedPercent);
+          const stale = isQuotaStale(sample.at, row.resetsAt ? Date.parse(row.resetsAt) : null, now);
+          const windowLabel = row.model ? `${row.label} · ${row.model}` : row.label;
+          return <div className="session-usage-window" key={row.id}>
+            <SessionRow label={windowLabel}>
+              <span title={row.resetsAt ? `Сброс ${time(row.resetsAt)}` : undefined}>{percentLabel(remaining)} осталось</span>
+            </SessionRow>
+            <SessionMeter label={`Остаток квоты: ${windowLabel}`} percent={remaining} />
+            {row.cost && <SessionRow label="Остаток бюджета">
+              <span title={`Лимит ${moneyLabel(row.cost.limitUsdCents / 100, "USD")}`}>{moneyLabel(remainingBudgetUsd(row.cost), "USD")}</span>
+            </SessionRow>}
+            {stale && <small>Замер устарел</small>}
+          </div>;
+        })}
+        {!sample?.windows.length && <SessionRow label="Квота">Нет данных</SessionRow>}
+        {measurement?.observedAt != null && <small title={source}>Замер {time(measurement.observedAt)}</small>}
+      </div>;
+    })}
+    {!quotas?.length && <SessionRow label="Квоты">{refreshing ? "Загрузка…" : "Нет данных"}</SessionRow>}
+    {limits && <details>
+      <summary>Лимиты этого треда <span>{limitStatus[limits.status]}</span></summary>
+      <small>Замер {time(limits.at)}{isQuotaStale(limits.at, null, now) ? " · устарел" : ""}</small>
+      {limits.windows.map((row, index) => <SessionRow key={row.providerKey ?? index} label={row.label ?? "Окно квоты"}>
+        <span title={row.resetsAtMs !== null ? `Сброс ${time(row.resetsAtMs)}` : undefined}>{limitStatus[row.status]}</span>
+      </SessionRow>)}
+    </details>}
+    {!quotas?.some(({ measurement }) => measurement?.usage.status === "ok" && measurement.observedAt !== null &&
+      measurement.usage.windows.some((row) => row.cost)) && <SessionRow label="Денежный баланс">Нет данных</SessionRow>}
+    <SessionRow label={<UrlLink href="/plugins/usage-page/usage">Стоимость сессии</UrlLink>}>
+      {cost ? <span title={`Отчёт провайдера · ${time(cost.at)}`}>{moneyLabel(cost.amount, cost.currency)}{cost.estimated ? " · оценка" : ""}</span> : "Нет данных"}
+    </SessionRow>
   </section>;
 }
 
@@ -55,6 +79,8 @@ export function SessionTelemetry({ threadId, providerId, hostId, workspacePath }
   const sdk = useSdk();
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
   const [quotas, setQuotas] = useState<Quotas | null | undefined>();
+  const [quotaRefresh, setQuotaRefresh] = useState(0);
+  const [refreshing, setRefreshing] = useState(true);
   const [inventory, setInventory] = useState<McpInventory | undefined>();
   const [now, setNow] = useState(Date.now);
 
@@ -80,13 +106,15 @@ export function SessionTelemetry({ threadId, providerId, hostId, workspacePath }
 
   useEffect(() => {
     const controller = new AbortController();
-    void readProviderQuotas(sdk, providerId, hostId, controller.signal).then((rows) => {
+    void readProviderQuotas(sdk, providerId, hostId, controller.signal, quotaRefresh > 0).then((rows) => {
       if (!controller.signal.aborted) setQuotas(rows);
     }).catch(() => {
       if (!controller.signal.aborted) setQuotas(null);
+    }).finally(() => {
+      if (!controller.signal.aborted) { setRefreshing(false); setNow(Date.now()); }
     });
     return () => controller.abort();
-  }, [sdk, providerId, hostId]);
+  }, [sdk, providerId, hostId, quotaRefresh]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -97,21 +125,25 @@ export function SessionTelemetry({ threadId, providerId, hostId, workspacePath }
   }, [sdk, providerId, hostId, workspacePath]);
 
   return <>
+    <QuotaSection telemetry={telemetry} quotas={quotas} now={now} refreshing={refreshing} refresh={() => {
+      setRefreshing(true);
+      setQuotaRefresh((value) => value + 1);
+    }} />
     <section className="session-section" aria-label="MCP">
-      <h3>MCP</h3>
+      <details open={!!inventory?.servers.length}>
+      <summary>MCP <span>{inventory ? `${inventory.servers.filter((server) => server.state === "configured").length}/${inventory.servers.length}` : "Нет данных"}</span></summary>
       {inventory ? <>
-        <small>Конфигурация MCP Manager · {time(inventory.scannedAt)}{inventory.truncated ? " · снимок неполный" : ""}</small>
+        <small>Конфигурация MCP Manager{inventory.truncated ? " · снимок неполный" : ""}</small>
         {inventory.servers.length
-          ? <ul>{inventory.servers.map((server) => <li key={server.id}>{server.name} · {configurationLabels[server.state]}</li>)}</ul>
+          ? inventory.servers.map((server) => <SessionRow key={server.id} label={<><i aria-hidden="true" className={`session-dot is-${server.state}`} />{server.name}</>}>{configurationLabels[server.state]}</SessionRow>)
           : <p>Для провайдера нет записей в инвентаре машины.</p>}
       </> : <p>{inventory === undefined ? "Загрузка конфигурации…" : "Подтверждённая конфигурация машины недоступна."}</p>}
       {!!telemetry?.tools?.length && <h4>Недавние вызовы в треде</h4>}
       {telemetry?.tools?.length ? <ul>{telemetry.tools.map(({ server, tool, status, at }) => <li key={JSON.stringify([server, tool])}>
         {server} · {tool} · {toolStatus[status] ?? status} · {time(at)}
       </li>)}</ul> : <p>{telemetry?.tools ? "В последних событиях нет вызовов MCP." : "События вызовов MCP пока недоступны."}</p>}
-      <p>Текущий список инструментов и состояние подключений сессии недоступны.</p>
       <UrlLink href="/plugins/mcp-manager/inventory">Открыть инвентарь MCP</UrlLink>
+      </details>
     </section>
-    <QuotaSection telemetry={telemetry} quotas={quotas} now={now} />
   </>;
 }

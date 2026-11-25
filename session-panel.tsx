@@ -4,6 +4,7 @@ import type { ExperimentalThreadTabProps } from "@get-bb/plugin-sdk/app";
 import { readSessionOverview, type SessionOverview } from "./lib/session-overview.js";
 import { readUncommittedFiles, readUncommittedPatch } from "./lib/git-status.js";
 import { SessionTelemetry } from "./session-telemetry.js";
+import { moneyLabel, percentLabel, SessionMeter, SessionRow } from "./session-rows.js";
 
 const checksLabels = {
   passing: "Пройдены",
@@ -87,31 +88,36 @@ function GitSection({ workspace }: { workspace: SessionOverview["workspace"] }) 
       detail.kind === "plugin" && detail.pluginId === "bb--git" && detail.tab.id === "diff");
     if (!tab || !panel.selectTab(tab.key)) setShowDiff((visible) => !visible);
   };
-  return <section className="session-section" aria-label="Git">
-    <h3>Git</h3>
-    {git?.outcome === "not_applicable" ? <p>В окружении нет Git.</p> : <>
+  return <div className="session-git" aria-label="Git">
+    {git?.outcome === "not_applicable" ? <SessionRow label="Git">В окружении нет Git</SessionRow> : <>
       {git?.outcome === "available"
         ? <>
-          <p>{git.branch ?? "Ветка не определена"} · изменённых файлов: {git.changedFiles}</p>
-          <button type="button" onClick={openDiff}>{showDiff ? "Свернуть дифф" : "Открыть дифф"}</button>
+          <SessionRow label="Ветка">{git.branch ?? "Нет данных"}</SessionRow>
+          <SessionRow label={<button type="button" onClick={openDiff}>{showDiff ? "Свернуть дифф" : "Открыть дифф"}</button>}>
+            {git.changedFiles} файл.
+          </SessionRow>
           {showDiff && workspace && <WorktreeDiff key={workspace.environment.id} environmentId={workspace.environment.id} />}
         </>
-        : <p>Состояние Git недоступно.</p>}
+        : <SessionRow label="Git">Нет данных</SessionRow>}
       {pullRequest?.outcome === "available" ? <>
-        <p><UrlLink href={pullRequest.pullRequest.url}>PR #{pullRequest.pullRequest.number} · {pullRequest.pullRequest.title}</UrlLink></p>
-        <p>Проверки: {checksLabels[pullRequest.pullRequest.checks.state]} · {pullRequest.pullRequest.checks.passedCount} из {pullRequest.pullRequest.checks.totalCount}</p>
-        <small>PR обновлён {formatTime(pullRequest.pullRequest.updatedAt)}</small>
-      </> : <p>{pullRequest?.outcome === "absent" ? "Для окружения нет PR." : "Данные PR и проверок недоступны."}</p>}
+        <SessionRow label={<UrlLink href={pullRequest.pullRequest.url}>{pullRequest.pullRequest.title}</UrlLink>}>#{pullRequest.pullRequest.number}</SessionRow>
+        <SessionRow label="Проверки">
+          <span title={checksLabels[pullRequest.pullRequest.checks.state]}>{pullRequest.pullRequest.checks.passedCount}/{pullRequest.pullRequest.checks.totalCount}</span>
+        </SessionRow>
+      </> : null}
     </>}
-  </section>;
+  </div>;
 }
 
 function WorkSection({ overview }: { overview: SessionOverview }) {
   const { openSpec, thread, tasks } = overview;
   const environmentId = thread.environmentId;
   const status = openSpec?.kind === "linked" ? openSpec.binding?.managedTaskStatus : null;
+  const linkedCount = (openSpec?.kind === "linked" ? 1 : 0) + (tasks?.filter(Boolean).length ?? 0);
+  const linksComplete = tasks !== null && (openSpec?.kind === "linked" || openSpec?.kind === "unlinked");
   return <section className="session-section" aria-label="Работа">
-    <h3>Работа</h3>
+    <details open={openSpec?.kind === "linked" || !!tasks?.length}>
+    <summary>Работа <span>{linksComplete ? linkedCount : linkedCount ? `≥${linkedCount}` : "Нет данных"}</span></summary>
     {openSpec?.kind === "linked" && environmentId ? <>
       <p><UrlLink href={openSpec.storeId
         ? "/plugins/openspec-bsl-flow/openspec"
@@ -134,6 +140,7 @@ function WorkSection({ overview }: { overview: SessionOverview }) {
       <UrlLink href={`/plugins/tasks/tasks/task/${encodeURIComponent(task.key)}`}>{task.key} · {task.title}</UrlLink> · {task.status}
     </p>)}
     <p><UrlLink href="/plugins/tasks/tasks">BB Tasks</UrlLink>{!tasks ? " · связи недоступны" : !tasks.length ? " · активные связи не найдены" : ""}</p>
+    </details>
   </section>;
 }
 
@@ -200,48 +207,70 @@ function SessionContent({ threadId, environment }: ExperimentalThreadTabProps) {
   const hostId = workspace?.environment.hostId ?? null;
   const workspacePath = workspace?.environment.path ?? null;
   const lastUsage = usage?.data.tokenUsage.last;
-  return <div className="session-panel">
-    <div className="session-actions">
+  const reportedCapacity = usage?.data.tokenUsage.modelContextWindow;
+  const contextPercent = window && window.modelContextWindow > 0 ? 100 * window.usedTokens / window.modelContextWindow : null;
+  const cacheHit = lastUsage && lastUsage.inputTokens > 0 && lastUsage.cachedInputTokens <= lastUsage.inputTokens
+    ? 100 * lastUsage.cachedInputTokens / lastUsage.inputTokens : null;
+  const categories = window?.snapshot?.categories.filter(({ kind }) => kind !== "free") ?? [];
+  return <div className="session-panel session-compact">
+    <div className="session-heading session-top">
       <h2>Сессия</h2>
       <button type="button" onClick={() => setRefresh((value) => value + 1)}>Обновить</button>
     </div>
-    <section className="session-section" aria-label="Проект и окружение">
-      <h3>Проект и окружение</h3>
-      {project ? <button type="button" onClick={() => navigate.toProject(project.id)}>{project.name}</button> : <p>Данные проекта недоступны.</p>}
-      <p>Машина: {workspace?.host?.name ?? hostId ?? "нет данных"}</p>
-      <p>Окружение: {workspace?.environment.name ?? environmentId ?? "не назначено"}</p>
-      {workspace?.environment.path && <p>{workspace.environment.path}</p>}
+    <section className="session-section session-context">
+      <SessionRow label="Контекст">{contextPercent === null ? "Нет данных" : percentLabel(contextPercent)}</SessionRow>
+      {contextPercent !== null && <SessionMeter label="Использование окна контекста" percent={contextPercent} />}
+      {window ? <small>
+        {window.usedTokens.toLocaleString()} / {window.modelContextWindow.toLocaleString()} токенов
+        {window.estimated ? " · оценка" : ""}
+        {windowTime !== null && <span title={formatTime(windowTime)}> · снимок BB</span>}
+      </small> : reportedCapacity ? <small>Окно {reportedCapacity.toLocaleString()} токенов</small> : null}
+      <SessionRow label="Попадание в кэш">{cacheHit === null ? "Нет данных" : percentLabel(cacheHit)}</SessionRow>
     </section>
-    <GitSection workspace={workspace} />
+    <section className="session-section" aria-label="Проект и окружение">
+      <SessionRow label="Проект">{project ? <button type="button" onClick={() => navigate.toProject(project.id)}>{project.name}</button> : "Нет данных"}</SessionRow>
+      <GitSection workspace={workspace} />
+      <details>
+        <summary>Рабочее окружение</summary>
+        <SessionRow label="Машина">{workspace?.host?.name ?? hostId ?? "Нет данных"}</SessionRow>
+        <SessionRow label="Окружение">{workspace?.environment.name ?? environmentId ?? "Не назначено"}</SessionRow>
+        {workspacePath && <p className="session-path">{workspacePath}</p>}
+      </details>
+    </section>
     <WorkSection overview={result} />
+    {!!categories.length && <section className="session-section" aria-label="Источники контекста">
+      <details>
+        <summary>Источники контекста <span>{categories.length}</span></summary>
+        {categories.map((category) => <SessionRow key={category.id} label={category.label}>{category.tokens.toLocaleString()}</SessionRow>)}
+      </details>
+    </section>}
+    <SessionTelemetry key={JSON.stringify([threadId, thread.providerId, model, hostId, workspacePath])} threadId={threadId} providerId={thread.providerId} hostId={hostId} workspacePath={workspacePath} />
     <section className="session-section" aria-label="Связанные треды">
-      <div className="session-actions">
-        <h3>Связанные треды</h3>
-        <button type="button" onClick={() => panel.openTab({ tab: { id: "agents", context: { kind: "thread" }, availability: "action" } })}>Агенты</button>
-      </div>
+      <SessionRow label={<button type="button" onClick={() => panel.openTab({ tab: { id: "agents", context: { kind: "thread" }, availability: "action" } })}>Агенты</button>}>
+        {children ? children.length > 20 ? "20+" : children.length : "Нет данных"}
+      </SessionRow>
+      {(!!children?.length || parent || thread.parentThreadId) && <details>
+      <summary>Связанные треды</summary>
       {parent && <p>Родитель: <button type="button" onClick={() => navigate.toThread(parent.id)}>{threadTitle(parent)}</button></p>}
       {!parent && thread.parentThreadId && <p>Родительский тред недоступен.</p>}
       {children?.length ? <ul>{children.slice(0, 20).map((child) =>
         <li key={child.id}><button type="button" onClick={() => navigate.toThread(child.id)}>{threadTitle(child)}</button></li>
       )}</ul> : <p>{children ? "Нет видимых дочерних тредов." : "Список дочерних тредов недоступен."}</p>}
       {children && children.length > 20 && <p>Ещё треды доступны во вкладке «Агенты».</p>}
+      </details>}
     </section>
-    <section className="session-section" aria-label="Контекст и ход">
-      <h3>Контекст и ход</h3>
-      <p>{providerName}{model ? ` · ${model}` : " · модель неизвестна"}</p>
-      <p>{window
-        ? `Окно: ${window.usedTokens.toLocaleString()} / ${window.modelContextWindow.toLocaleString()} токенов${window.estimated ? " · оценка" : ""}`
-        : usage?.data.tokenUsage.modelContextWindow != null
-          ? `Размер окна: ${usage.data.tokenUsage.modelContextWindow.toLocaleString()} токенов · использование неизвестно`
-          : "Использование окна контекста недоступно."}</p>
-      {window && <small>{windowTime === null ? "Время замера неизвестно" : `Снимок BB · ${formatTime(windowTime)}`}</small>}
-      {turn ? <p>{turn.type === "turn/started" ? "Ход начался" : "Ход завершился"} {formatTime(turn.createdAt)}</p> : <p>Время последнего хода недоступно.</p>}
-      {lastUsage && usage ? <>
-        <p>Последний отчёт: {lastUsage.inputTokens.toLocaleString()} входных и {lastUsage.outputTokens.toLocaleString()} выходных токенов · кэш: {lastUsage.cachedInputTokens.toLocaleString()}</p>
-        <small>Статистика провайдера · {formatTime(usage.createdAt)}</small>
-      </> : <p>Статистика токенов недоступна.</p>}
+    <section className="session-section" aria-label="Последний ход">
+      <details>
+        <summary>Последний ход <span>{turn ? new Date(turn.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Нет данных"}</span></summary>
+        <SessionRow label="Модель">{providerName}{model ? ` · ${model}` : ""}</SessionRow>
+        {turn && <SessionRow label={turn.type === "turn/started" ? "Начало" : "Завершение"}>{formatTime(turn.createdAt)}</SessionRow>}
+        {lastUsage && <>
+          <SessionRow label="Входные токены">{lastUsage.inputTokens.toLocaleString()}</SessionRow>
+          <SessionRow label="Токены из кэша">{lastUsage.cachedInputTokens.toLocaleString()}</SessionRow>
+          <SessionRow label="Выходные токены">{lastUsage.outputTokens.toLocaleString()}</SessionRow>
+        </>}
+      </details>
     </section>
-    <SessionTelemetry key={JSON.stringify([threadId, thread.providerId, model, hostId, workspacePath])} threadId={threadId} providerId={thread.providerId} hostId={hostId} workspacePath={workspacePath} />
   </div>;
 }
 
