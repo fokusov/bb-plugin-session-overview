@@ -1,0 +1,60 @@
+.session-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.session-panel :is(h2, h3, h4, p, dl, ul, ol) { margin: 0; }
+.session-panel h2 { font-size: 17px; font-weight: 650; }
+.session-panel h3 { font-size: 14px; font-weight: 650; }
+.session-panel h4 { font-size: 13px; font-weight: 600; }
+.session-panel small { opacity: .8; }
+.session-panel :is(ul, ol) { padding-inline-start: 20px; }
+.session-panel dd { margin-inline-start: 12px; }
+.session-panel dt { font-weight: 600; }
+.session-panel a { text-decoration: underline; }
+
+.session-panel button {
+  width: fit-content;
+  padding: 3px 8px;
+  border: 1px solid var(--bb-border, #8885);
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: start;
+}
+
+.session-panel button:hover,
+.session-panel button[aria-current="true"],
+.session-panel button[aria-pressed="true"] {
+  background: var(--bb-muted, #8882);
+}
+
+.session-section {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--bb-border, #8885);
+  border-radius: 8px;
+}
+
+.session-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.session-tree { display: grid; gap: 4px; }
+.session-tree button {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.session-timeline li + li { margin-block-start: 4px; }
