@@ -1,3 +1,20 @@
+import type { useSdk } from "@get-bb/plugin-sdk/app";
+
+type ThreadEvents = ReturnType<typeof useSdk>["threads"]["events"];
+export type AgentEvent = Awaited<ReturnType<ThreadEvents["list"]>>[number];
+
+const agentEventTypes = [
+  "item/delegation/progress", "item/delegation/completed",
+  "thread/contextWindowUsage/updated", "thread/tokenUsage/updated", "thread/context/cleared",
+  "item/backgroundTask/progress", "item/backgroundTask/completed",
+  "turn/started", "turn/completed", "turn/input/accepted", "client/turn/requested",
+] as const;
+
+export async function readAgentEvents(events: Pick<ThreadEvents, "list">, threadId: string, signal: AbortSignal): Promise<AgentEvent[]> {
+  const rows = await events.list({ threadId, types: agentEventTypes, order: "desc", limit: "100", signal });
+  return rows.filter((event) => event.threadId === threadId).sort((a, b) => a.createdAt - b.createdAt || a.seq - b.seq);
+}
+
 export type AgentThread = {
   id: string;
   parentThreadId: string | null;

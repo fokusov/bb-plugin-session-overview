@@ -18,6 +18,24 @@ test("отбрасывает телеметрию другого провайд�
   assert.deepEqual(metrics, { cost: null, limits: null, tools: [] });
 });
 
+test("показывает последнее подтверждённое событие MCP только из выбранного треда", async () => {
+  const sdk = {
+    threads: { events: { list: async ({ types }: { types: string[] }) => {
+      if (!types.includes("item/completed")) return [];
+      const item = { type: "toolCall", server: "catalog", tool: "list", status: "completed" };
+      return [
+        { threadId: "other", type: "item/completed", createdAt: 120, data: { item: { ...item, server: "other" } } },
+        { threadId: "t1", type: "item/completed", createdAt: 110, data: { item } },
+        { threadId: "t1", type: "item/started", createdAt: 100, data: { item: { ...item, status: "pending" } } },
+        { threadId: "t1", type: "item/started", createdAt: 95, data: { item: { type: "toolCall", tool: "shell", status: "pending" } } },
+      ];
+    } } },
+  } as unknown as Parameters<typeof readThreadTelemetry>[0];
+  assert.deepEqual((await readThreadTelemetry(sdk, "t1", "codex", signal)).tools, [
+    { server: "catalog", tool: "list", status: "completed", at: 110 },
+  ]);
+});
+
 test("запрашивает только квоту провайдера на совпадающей машине и отклоняет сменившийся аккаунт", async () => {
   const requests: string[] = [];
   const source = { pluginId: "test-provider", displayName: "Provider" };

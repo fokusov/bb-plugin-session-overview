@@ -2,10 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { z } from "zod";
 import { UrlLink, useBbNavigate, useSdk } from "@get-bb/plugin-sdk/app";
 import type { ExperimentalThreadTabProps } from "@get-bb/plugin-sdk/app";
-import { buildAgentTree, formatAgentStatus, formatTokenCount, formatWorkflowAttemptStatus, parseOrchestrationMetadata, projectGraphRunAttempts, projectWorkflowAttempts, type AgentThread, type AgentTreeNode, type GraphRunAttempt, type WorkflowAgentAttempt } from "./lib/session-agents.js";
+import { buildAgentTree, formatAgentStatus, formatTokenCount, formatWorkflowAttemptStatus, parseOrchestrationMetadata, projectGraphRunAttempts, projectWorkflowAttempts, readAgentEvents, type AgentEvent, type AgentThread, type AgentTreeNode, type GraphRunAttempt, type WorkflowAgentAttempt } from "./lib/session-agents.js";
 
-type Sdk = ReturnType<typeof useSdk>;
-type ThreadEventRow = Awaited<ReturnType<Sdk["threads"]["events"]["list"]>>[number];
 const TREE_REFRESH_MS = 10_000;
 const MAX_TREE_THREADS = 200;
 const MAX_LOCAL_CACHES = 20;
@@ -25,13 +23,6 @@ const graphRunListSchema = z.object({ runs: z.array(graphRunSchema) });
 const graphRunGetSchema = z.object({ run: graphRunSchema.nullable() });
 type GraphRunRow = z.infer<typeof graphRunSchema>;
 const selectedThreadByParent = new Map<string, string>();
-const TREE_EVENT_TYPES = ["item/delegation/progress", "item/delegation/completed"] as const;
-const DETAIL_EVENT_TYPES = [
-  ...TREE_EVENT_TYPES,
-  "thread/contextWindowUsage/updated", "thread/tokenUsage/updated", "item/backgroundTask/progress", "item/backgroundTask/completed", "turn/started",
-  "turn/completed", "turn/input/accepted", "client/turn/requested",
-  "thread/context/cleared",
-] as const;
 type ReadState<T> = { threadId: string; status: "loading" } | { threadId: string; status: "error" } | { threadId: string; status: "ready"; value: T };
 type WorktreeInfo = { name: string | null; path: string | null; isWorktree: boolean };
 
@@ -54,7 +45,7 @@ function TreeItem({ node, selected, onSelect, depth = 0 }: { node: AgentTreeNode
   </>;
 }
 
-function eventDescription(event: ThreadEventRow): string {
+function eventDescription(event: AgentEvent): string {
   if (event.type === "item/delegation/progress" || event.type === "item/delegation/completed") {
     return event.data.item.summary || event.data.item.label || event.data.item.presentation?.detail || `Делегирование · ${event.data.providerThreadId}`;
   }
@@ -78,7 +69,7 @@ function AgentsContent({ threadId, environment }: ExperimentalThreadTabProps) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [eventsState, setEventsState] = useState<ReadState<ThreadEventRow[]>>({ threadId: selectedId, status: "loading" });
+  const [eventsState, setEventsState] = useState<ReadState<AgentEvent[]>>({ threadId: selectedId, status: "loading" });
   const [modelState, setModelState] = useState<ReadState<string | null>>({ threadId: selectedId, status: "loading" });
   const [worktreeState, setWorktreeState] = useState<ReadState<WorktreeInfo>>({ threadId: selectedId, status: "loading" });
   const [graphState, setGraphState] = useState<ReadState<GraphRunRow[]>>({ threadId, status: "loading" });
@@ -170,8 +161,8 @@ function AgentsContent({ threadId, environment }: ExperimentalThreadTabProps) {
     if (selectedUpdatedAt === undefined) return;
     let disposed = false;
     const controller = new AbortController();
-    void sdk.threads.events.list({ threadId: selectedId, types: DETAIL_EVENT_TYPES, order: "desc", limit: "200", signal: controller.signal })
-      .then((events) => { if (!disposed) setEventsState({ threadId: selectedId, status: "ready", value: events.sort((a, b) => a.createdAt - b.createdAt || a.seq - b.seq) }); })
+    void readAgentEvents(sdk.threads.events, selectedId, controller.signal)
+      .then((events) => { if (!disposed) setEventsState({ threadId: selectedId, status: "ready", value: events }); })
       .catch(() => { if (!disposed && !controller.signal.aborted) setEventsState({ threadId: selectedId, status: "error" }); });
     return () => { disposed = true; controller.abort(); };
   }, [sdk, selectedId, selectedUpdatedAt, refreshKey]);
@@ -309,7 +300,7 @@ export function AgentsPanel(props: ExperimentalThreadTabProps) {
   return <AgentsContent key={JSON.stringify([props.threadId, props.environment?.id])} {...props} />;
 }
 
-function ContextSnapshot({ event }: { event: Extract<ThreadEventRow, { type: "thread/contextWindowUsage/updated" }> }) {
+function ContextSnapshot({ event }: { event: Extract<AgentEvent, { type: "thread/contextWindowUsage/updated" }> }) {
   const usage = event.data.contextWindowUsage;
   const snapshot = usage.snapshot;
   return <dl>

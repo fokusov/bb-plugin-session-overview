@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildAgentTree, formatAgentStatus, formatTokenCount, parseOrchestrationMetadata, projectGraphRunAttempts, projectWorkflowAttempts } from "../lib/session-agents.ts";
+import { buildAgentTree, formatAgentStatus, formatTokenCount, parseOrchestrationMetadata, projectGraphRunAttempts, projectWorkflowAttempts, readAgentEvents, type AgentEvent } from "../lib/session-agents.ts";
 
 const thread = (id: string, parentThreadId: string | null, updatedAt = 0) => ({
   id, parentThreadId, title: null, titleFallback: null, status: "active", providerId: "codex", environmentId: null, updatedAt,
@@ -18,6 +18,39 @@ test("formats statuses and token counts without inventing unavailable values", (
   assert.equal(formatAgentStatus("some-future-status"), "some-future-status");
   assert.equal(formatTokenCount(null), "Недоступно");
   assert.equal(formatTokenCount(12000), "12 000");
+});
+
+test("reads a native delegation without a worker thread or a context snapshot", async () => {
+  const delegation: AgentEvent = {
+    id: "delegation-1", seq: 21, createdAt: 100, threadId: "parent", scope: { kind: "thread" },
+    type: "item/delegation/completed",
+    data: {
+      providerThreadId: "provider-session",
+      item: { id: "native-1", childRef: "provider-child", type: "delegation", label: "Проверка", status: "completed", background: true },
+    },
+  };
+  const rows = await readAgentEvents({
+    list: async ({ threadId, types, limit }) => {
+      assert.equal(threadId, "parent");
+      assert.equal(limit, "100");
+      assert.ok(types?.includes("item/delegation/completed"));
+      return [delegation, {
+        ...delegation,
+        id: "context-1",
+        threadId: "unrelated",
+        type: "thread/contextWindowUsage/updated",
+        data: { providerThreadId: "unrelated-session", contextWindowUsage: { estimated: false, modelContextWindow: 1000, usedTokens: 2 } },
+      }];
+    },
+  }, "parent", new AbortController().signal);
+  assert.deepEqual(rows, [delegation]);
+});
+
+test("propagates access denial instead of representing it as empty history", async () => {
+  const denied = Object.assign(new Error("Forbidden"), { status: 403 });
+  await assert.rejects(readAgentEvents({
+    list: async () => { throw denied; },
+  }, "parent", new AbortController().signal), (error) => error === denied);
 });
 
 test("accepts only valid orchestration metadata and preserves optional run and review links", () => {
