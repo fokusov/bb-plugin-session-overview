@@ -25,7 +25,16 @@ export const passportSchema = z.object({
   }).strict(),
 }).strict();
 
-export type PassportSnapshot = z.infer<typeof passportSchema>;
+export const passportV2Schema = passportSchema.extend({
+  structure: z.object({
+    bslModules: z.number().int().nonnegative(),
+    bslLines: z.number().int().nonnegative(),
+    objectsByRoot: z.record(z.string(), z.number().int().nonnegative()),
+    extensions: z.array(z.object({ root: z.string(), purpose: z.string() }).strict()),
+  }).strict(),
+});
+
+export type PassportSnapshot = z.infer<typeof passportSchema> & Partial<Pick<z.infer<typeof passportV2Schema>, "structure">>;
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} Б`;

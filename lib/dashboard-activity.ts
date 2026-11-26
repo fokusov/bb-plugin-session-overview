@@ -13,19 +13,15 @@ export const activityMetricDefinitions = [
   { id: "tasks", label: "Задачи", description: "Задачи BB Tasks по дню последнего изменения" },
   { id: "builds", label: "Сборки", description: "Сборки и разборы из журнала операций 1С" },
   { id: "tests", label: "Тесты", description: "Проверки, YAxUnit и Vanessa из журнала операций 1С" },
+  { id: "turns", label: "Ходы", description: "Завершившиеся ходы по отметке времени BB" },
+  { id: "reviews", label: "Ревью", description: "Завершённые ходы выделенных рецензентов 1С" },
+  { id: "tokens", label: "Токены", description: "Прирост счётчика провайдера по дню снимка BB" },
 ] as const;
 
 export type DashboardMetric = (typeof activityMetricDefinitions)[number]["id"];
 export const dashboardMetrics: readonly DashboardMetric[] = activityMetricDefinitions.map((item) => item.id);
 
-/** Metrics without a public per-day contract. The UI shows the reason instead of zeros. */
-export const unavailableActivityMetrics: Readonly<Record<string, string>> = {
-  turns: "Ходы агента: BB не отдаёт историю ходов за период без чтения событий каждого треда, поэтому календарь их не показывает.",
-  reviews: "Ревью: у BSL Flow есть текущее состояние ревью, но нет отметки времени события ревью.",
-  tokens: "Токены: провайдер отдаёт только последний накопительный снимок треда, без разбивки по дням.",
-};
-
-export type ActivitySource = "thread" | "commit" | "task" | "operation" | "test";
+export type ActivitySource = "thread" | "commit" | "task" | "operation" | "test" | "agent";
 
 export interface ActivityEvent {
   /** Stable identity of the source record, used to merge pages and deduplicate. */
@@ -39,6 +35,7 @@ export interface ActivityEvent {
   threadId: string | null;
   environmentId: string | null;
   commitHash: string | null;
+  amount?: number;
 }
 
 export type CalendarPeriod = "last12" | number;
@@ -180,9 +177,10 @@ export function buildCalendar(
   for (const event of selectActivity(events, filter)) {
     const day = localDay(event.at);
     if (day < fromDay || day > toDay) continue;
-    counts.set(day, (counts.get(day) ?? 0) + 1);
+    const amount = event.amount ?? 1;
+    counts.set(day, (counts.get(day) ?? 0) + amount);
     projects.add(event.projectId);
-    total += 1;
+    total += amount;
   }
   const max = Math.max(0, ...counts.values());
   const first = startOfWeek(fromDay);

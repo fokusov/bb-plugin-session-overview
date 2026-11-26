@@ -22,13 +22,18 @@ import type { CostTask, CostThread, TaskLink } from "./dashboard-cost.ts";
 import type { OperationEntry, OperationReport, WorkspaceQuality } from "./dashboard-quality.ts";
 import { isBuildAction } from "./dashboard-quality.ts";
 import type { DashboardThread } from "./dashboard-types.ts";
+import { historyEventTypes, summarizeThreadHistory, usageSnapshotEventTypes, type ProjectUsageHistory } from "./dashboard-usage.ts";
+import { parseOrchestrationMetadata } from "./session-agents.ts";
 import type { PassportSnapshot } from "./passport.ts";
-import { passportSchema } from "./passport.ts";
+import { passportSchema, passportV2Schema } from "./passport.ts";
 
 type Sdk = ReturnType<typeof useSdk>;
 const THREAD_PAGE_SIZE = 200;
 export const THREAD_SCAN_LIMIT = 10_000;
 const USAGE_THREAD_LIMIT = 250;
+const USAGE_HISTORY_THREAD_LIMIT = 60;
+const USAGE_HISTORY_PAGE_SIZE = 100;
+const USAGE_HISTORY_PAGES = 3;
 const OPERATION_LIMIT = 60;
 
 export interface ReadResult<T> {
@@ -39,6 +44,10 @@ export interface ReadResult<T> {
 
 function message(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function missingMethod(cause: unknown): boolean {
+  return !!cause && typeof cause === "object" && "code" in cause && cause.code === "unknown_method";
 }
 
 /** A slow repository must not block the whole commits load. */
@@ -415,7 +424,7 @@ export async function readProjectOperations(
       const payload = await sdk.plugins.callRpc({ ...request, method: "platformDashboardV2", outputSchema: platformDashboardV2Schema });
       ({ entries, diagnostics } = payload);
     } catch (cause) {
-      if (!cause || typeof cause !== "object" || !("code" in cause) || cause.code !== "unknown_method") throw cause;
+      if (!missingMethod(cause)) throw cause;
       ({ entries } = await sdk.plugins.callRpc({ ...request, method: "platformDashboardV1", outputSchema: platformDashboardSchema }));
     }
     return { value: { entries: entries.slice(0, OPERATION_LIMIT), diagnostics }, complete: entries.length <= OPERATION_LIMIT, error: null };
@@ -473,13 +482,18 @@ export async function readProjectPassport(
   environmentId?: string,
 ): Promise<ReadResult<PassportSnapshot | null>> {
   try {
-    const snapshot = await sdk.plugins.callRpc({
+    const request = {
       pluginId: "1c-properties",
-      method: "passport",
       input: { projectId, ...(environmentId ? { environmentId } : {}) },
-      outputSchema: passportSchema,
-      signal,
-    });
+      signal: bounded(signal, 30_000),
+    };
+    let snapshot: PassportSnapshot;
+    try {
+      snapshot = await sdk.plugins.callRpc({ ...request, method: "passportV2", outputSchema: passportV2Schema });
+    } catch (cause) {
+      if (!missingMethod(cause)) throw cause;
+      snapshot = await sdk.plugins.callRpc({ ...request, method: "passport", outputSchema: passportSchema });
+    }
     return { value: snapshot, complete: true, error: null };
   } catch (cause) {
     return { value: null, complete: false, error: message(cause) };
@@ -517,11 +531,22 @@ export async function readProjectUsage(
   sdk: Sdk,
   threads: readonly DashboardThread[],
   signal: AbortSignal,
-): Promise<ReadResult<CostThread[]>> {
+): Promise<ReadResult<CostThread[]> & { history: ProjectUsageHistory }> {
   const rows: CostThread[] = [];
   let complete = true;
   let next = 0;
   const selected = threads.slice(0, USAGE_THREAD_LIMIT);
+  const history: ProjectUsageHistory = {
+    threads: [], scanned: 0, total: threads.length, incomplete: 0, reviewerMetadata: true,
+  };
+  const historyIds = selected.slice(0, USAGE_HISTORY_THREAD_LIMIT).map(({ id }) => id);
+  const historyIdsSet = new Set(historyIds);
+  const metadata = historyIds.length ? await sdk.threads.experimental_listPluginMetadata({
+    pluginId: "1c-properties", threadIds: historyIds, signal: bounded(signal),
+  }).catch(() => null) : { threads: [] };
+  history.reviewerMetadata = metadata !== null;
+  const reviewers = new Set(metadata?.threads.flatMap(({ threadId, metadata: row }) =>
+    parseOrchestrationMetadata(row.orchestration)?.role === "reviewer" ? [threadId] : []) ?? []);
   const worker = async () => {
     for (;;) {
       const thread = selected[next++];
@@ -538,18 +563,26 @@ export async function readProjectUsage(
         status: "unreported",
       };
       try {
-        const [events, options] = await Promise.all([
-          sdk.threads.events.list({
+        const withHistory = historyIdsSet.has(thread.id);
+        const options = sdk.threads.defaultExecutionOptions({ threadId: thread.id, signal: bounded(signal) }).catch(() => null);
+        const readPage = (beforeSeq?: string) => sdk.threads.events.list({
             threadId: thread.id,
-            types: ["thread/tokenUsage/updated", "thread/contextWindowUsage/updated"],
+            types: historyEventTypes,
             order: "desc",
-            limit: "50",
-            signal,
-          }),
-          sdk.threads.defaultExecutionOptions({ threadId: thread.id, signal }).catch(() => null),
-        ]);
-        const token = events.map((event) => tokenEventSchema.safeParse(event)).find((result) => result.success);
-        const context = events.map((event) => contextEventSchema.safeParse(event)).find((result) => result.success);
+            limit: String(USAGE_HISTORY_PAGE_SIZE),
+            beforeSeq,
+            signal: bounded(signal),
+          });
+        // Read the latest usage separately so activity or a sparse provider
+        // cannot crowd its last snapshot out of a page of completed turns.
+        const events = await sdk.threads.events.list({
+          threadId: thread.id, types: usageSnapshotEventTypes,
+          order: "desc", limit: "50", signal: bounded(signal),
+        });
+        const clearedAt = events.find((event) => event.type === "thread/context/cleared")?.seq ?? -1;
+        const sinceClear = events.filter(({ seq }) => seq > clearedAt);
+        const token = sinceClear.map((event) => tokenEventSchema.safeParse(event)).find((result) => result.success);
+        const context = sinceClear.map((event) => contextEventSchema.safeParse(event)).find((result) => result.success);
         const total = token?.success ? token.data.data.tokenUsage.total : null;
         const lastTurn = token?.success ? token.data.data.tokenUsage.last.totalTokens : null;
         const contextData = context?.success ? context.data.data.contextWindowUsage : null;
@@ -562,7 +595,7 @@ export async function readProjectUsage(
         } : null;
         rows.push({
           ...base,
-          modelId: options?.model ?? null,
+          modelId: (await options)?.model ?? null,
           status: usage ? "reported" : "unreported",
           usage,
           lastTurnTokens: lastTurn,
@@ -570,15 +603,36 @@ export async function readProjectUsage(
             ? { amount: contextData.cost.amount, currency: contextData.cost.currency, estimated: contextData.estimated }
             : null,
         });
+        if (withHistory) {
+          let all = [] as Awaited<ReturnType<typeof readPage>>;
+          let nextPage = true;
+          try {
+            let cursor: number | undefined;
+            for (let page = 0; page < USAGE_HISTORY_PAGES && nextPage; page++) {
+              const batch = await readPage(cursor?.toString());
+              const oldest = batch.at(-1)?.seq;
+              if (oldest !== undefined && cursor !== undefined && oldest >= cursor) break;
+              all.push(...batch);
+              nextPage = batch.length === USAGE_HISTORY_PAGE_SIZE;
+              cursor = oldest;
+            }
+          } catch {
+            nextPage = true;
+          }
+          history.scanned++;
+          if (nextPage) history.incomplete++;
+          history.threads.push(summarizeThreadHistory(all, thread, reviewers.has(thread.id)));
+        }
       } catch {
         if (signal.aborted) return;
         rows.push({ ...base, status: "error" });
+        if (historyIdsSet.has(thread.id)) history.incomplete++;
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(4, selected.length) }, worker));
   if (threads.length > USAGE_THREAD_LIMIT) complete = false;
-  return { value: rows, complete, error: null };
+  return { value: rows, complete, error: null, history };
 }
 
 

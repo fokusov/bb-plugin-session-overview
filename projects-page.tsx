@@ -5,7 +5,8 @@ import { summarizeWorkspaceStatus, workspaceStatusSchema } from "./lib/git-statu
 import { summarizeProjects, type ProjectSummary } from "./lib/projects.js";
 import { formatBytes } from "./lib/passport.js";
 import type { PassportSnapshot } from "./lib/passport.js";
-import { buildCalendar, buildFeed, calendarRange, dedupeCommits, localDay, unavailableActivityMetrics, activityMetricDefinitions, type ActivityEvent, type DashboardMetric } from "./lib/dashboard-activity.js";
+import { buildCalendar, buildFeed, calendarRange, dedupeCommits, localDay, activityMetricDefinitions, type ActivityEvent, type DashboardMetric } from "./lib/dashboard-activity.js";
+import type { ProjectUsageHistory } from "./lib/dashboard-usage.js";
 import {
   defaultDashboardFilters,
   dashboardFiltersStorageKey,
@@ -167,6 +168,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
   const [openSpec, setOpenSpec] = useState<Record<string, ReadResult<OpenSpecSummary | null>>>({});
   const [workspaceOperations, setWorkspaceOperations] = useState<Record<string, ReadResult<WorkspaceQuality> | undefined>>({});
   const [usage, setUsage] = useState<Record<string, Loadable<CostSummary>>>({});
+  const [history, setHistory] = useState<Record<string, Loadable<ProjectUsageHistory>>>({});
   const [filters, setFilters] = useState<DashboardFilters>(initialFilters);
   const [pinned, setPinned] = useState<string[]>(initialPins);
   const [showAll, setShowAll] = useState(false);
@@ -298,9 +300,12 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
     const list: ActivityEvent[] = [...threadActivityEvents(threads.value)];
     for (const [projectId, projectTasks] of Object.entries(tasks)) list.push(...taskActivityEvents(projectTasks.tasks, projectId));
     for (const [projectId, result] of Object.entries(operations)) list.push(...operationActivityEvents(result.value.entries, projectId));
+    for (const item of Object.values(history)) {
+      if (item.status === "ready") for (const thread of item.value.threads) list.push(...thread.events);
+    }
     if (commits.status === "ready") list.push(...commits.events);
     return dedupeCommits(list).events.sort((a, b) => b.at - a.at || a.id.localeCompare(b.id));
-  }, [threads, tasks, operations, commits]);
+  }, [threads, tasks, operations, commits, history]);
 
   const calendar = useMemo(() => buildCalendar(activityEvents, filters), [activityEvents, filters]);
   const periodEvents = useMemo(() => {
@@ -377,10 +382,12 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
     const controller = new AbortController();
     usageAborts.current.set(projectId, controller);
     setUsage((current) => ({ ...current, [projectId]: { status: "loading" } }));
-    const projectRows = projectThreads.get(projectId) ?? [];
+    setHistory((current) => ({ ...current, [projectId]: { status: "loading" } }));
+    const projectRows = (projectThreads.get(projectId) ?? []).slice().sort((a, b) => b.updatedAt - a.updatedAt);
     void readProjectUsage(sdk, projectRows, controller.signal)
       .then((result) => {
         if (controller.signal.aborted) return;
+        setHistory((current) => ({ ...current, [projectId]: { status: "ready", value: result.history } }));
         const projectTasks = tasks[projectId];
         if (!projectTasks) {
           setUsage((current) => ({ ...current, [projectId]: { status: "error", error: "Задачи BB Tasks не загружены: атрибуция недоступна" } }));
@@ -392,7 +399,11 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
         }));
       })
       .catch((cause: unknown) => {
-        if (!controller.signal.aborted) setUsage((current) => ({ ...current, [projectId]: { status: "error", error: errorText(cause) } }));
+        if (!controller.signal.aborted) {
+          const failure = { status: "error" as const, error: errorText(cause) };
+          setUsage((current) => ({ ...current, [projectId]: failure }));
+          setHistory((current) => ({ ...current, [projectId]: failure }));
+        }
       });
   };
 
@@ -401,6 +412,9 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
   const calendarProject = filters.projectId ? projectNames[filters.projectId] ?? filters.projectId : "Все проекты";
   const coverage = `${calendar.fromDay} — ${calendar.toDay}`;
   const metricLabel = activityMetricDefinitions.find(({ id }) => id === filters.metric)?.label ?? filters.metric;
+  const usageMetric = filters.metric === "turns" || filters.metric === "reviews" || filters.metric === "tokens";
+  const selectedHistory = filters.projectId ? history[filters.projectId] : undefined;
+  const metricUnit = filters.metric === "tokens" ? "токенов" : "событий";
 
   return <main className="dashboard-page">
     <header className="dashboard-header">
@@ -454,8 +468,8 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
                   role="gridcell"
                   className={`dashboard-day dashboard-level-${cell.level}`}
                   aria-pressed={selectedDay === cell.day}
-                  aria-label={`${cell.day}: ${cell.count} событий (${metricLabel})`}
-                  title={`${cell.day}: ${cell.count}`}
+                  aria-label={`${cell.day}: ${cell.count.toLocaleString()} ${metricUnit} (${metricLabel})`}
+                  title={`${cell.day}: ${cell.count.toLocaleString()}`}
                   onClick={() => updateFilter({ day: selectedDay === cell.day ? null : cell.day })}
                 />)}
             </div>)}
@@ -466,7 +480,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
         <span>Меньше</span>
         {[0, 1, 2, 3, 4].map((level) => <span key={level} className={`dashboard-day dashboard-level-${level}`} aria-hidden="true" />)}
         <span>Больше</span>
-        <span className="dashboard-note">Событий: {calendar.total} · проектов: {calendar.projects}</span>
+        <span className="dashboard-note">{calendar.total.toLocaleString()} {metricUnit} · проектов: {calendar.projects}</span>
       </div>
       <ul className="dashboard-coverage" aria-label="Охват источников">        <li>Треды: {threads.value.length} видимых · история {threads.complete ? "полная" : `ограничена первыми ${THREAD_SCAN_LIMIT.toLocaleString()}`}</li>
         <li>Коммиты: {!filters.projectId ? "выберите проект, чтобы загрузить коммиты" : commitThreads.length === 0 ? "у проекта нет видимых тредов и окружений" : commits.status === "ready" ? `${commits.events.length}${commits.complete ? "" : " · частично"}` : commits.status === "error" ? "недоступны" : filters.metric === "commits" ? "загружаются…" : "загружаются при выборе метрики"}</li>
@@ -479,7 +493,21 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
       {filters.metric === "commits" && commits.status === "loading" && <p role="status">Загружаю коммиты из git-history…</p>}
       {filters.metric === "commits" && commits.error && <p role="status">Коммиты: {commits.error}</p>}
       {filters.metric === "commits" && commits.status === "ready" && !commits.complete && <p role="status">Коммиты прочитаны не полностью: показан ограниченный диапазон истории.</p>}
-      <p className="dashboard-note">{unavailableActivityMetrics.turns} {unavailableActivityMetrics.reviews} {unavailableActivityMetrics.tokens}</p>
+      {usageMetric && (!filters.projectId
+        ? <p role="status">Выбери проект для загрузки истории ходов, ревью и токенов.</p>
+        : <div>
+          <button type="button" disabled={selectedHistory?.status === "loading"} onClick={() => loadUsage(filters.projectId!)}>Загрузить историю проекта</button>
+          {selectedHistory?.status === "loading" && <p role="status">Загружаю историю…</p>}
+          {selectedHistory?.status === "error" && <p role="status">{selectedHistory.error}</p>}
+          {selectedHistory?.status === "ready" && <p className="dashboard-note">
+            История: {selectedHistory.value.scanned} из {selectedHistory.value.total} тредов
+            {selectedHistory.value.incomplete > 0 && ` · с ограничениями: ${selectedHistory.value.incomplete}`}
+            {filters.metric === "reviews" && (selectedHistory.value.reviewerMetadata
+              ? " · учитываются завершённые ходы выделенных рецензентов 1С"
+              : " · метки рецензентов недоступны")}
+            {filters.metric === "tokens" && " · токены по дате снимка BB"}
+          </p>}
+        </div>)}
     </section>
 
     <section className="dashboard-panel" aria-label="Хронология работы">
@@ -555,6 +583,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
             revision={operationGit?.headSha ?? null}
             sourceDirty={operationGit?.hasUncommittedChanges ?? null}
             usage={usageState}
+            history={history[project.id]}
             commitCount={commits.status === "ready" ? commits.events.filter((event) => event.projectId === project.id).length : null}
             threads={rows}
             taskLabelByThread={taskLabelByThread}
@@ -584,6 +613,7 @@ function ProjectCardView(props: {
   sourceDirty: boolean | null;
   revision: string | null;
   usage: Loadable<CostSummary> | undefined;
+  history: Loadable<ProjectUsageHistory> | undefined;
   commitCount: number | null;
   threads: readonly DashboardThread[];
   taskLabelByThread: ReadonlyMap<string, string>;
@@ -699,6 +729,7 @@ function ProjectCardView(props: {
         {!usage && <p>Токены читаются по явному запросу: один последний накопительный снимок на тред, дети и «Без задачи» входят в сумму.</p>}
         {usage?.status === "error" && <p role="status">Расход недоступен: {usage.error}</p>}
         {usage?.status === "ready" && <CostDetails summary={usage.value} />}
+        {props.history?.status === "ready" && <UsageHistoryDetails history={props.history.value} />}
       </section>
     </section>}
 
@@ -726,6 +757,8 @@ function PassportDetails({ state }: { state: Loadable<PassportSnapshot | null> |
   const snapshot = state.value;
   if (!snapshot) return <p>Паспорт недоступен для выбранной рабочей копии.</p>;
   const counters = summarizeSourceCounters(snapshot.metrics);
+  const structure = snapshot.structure;
+  const countAvailable = counters.complete || counters.trackedFiles > 0;
   return <>
     {snapshot.ambiguous && <p role="status">Найден неоднозначный набор конфигураций.</p>}
     {!snapshot.configComplete && <p role="status">Метаданные конфигурации неполные{snapshot.configError ? `: ${snapshot.configError}` : ""}.</p>}
@@ -735,9 +768,15 @@ function PassportDetails({ state }: { state: Loadable<PassportSnapshot | null> |
         <strong>{configuration.format.toUpperCase()}</strong>{configuration.name ? ` · ${configuration.name}` : " · имя: нет данных"}
         {configuration.synonym ? ` · ${configuration.synonym}` : ""}
         {configuration.version ? ` · ${configuration.version}` : " · версия: нет данных"}
+        {structure?.extensions.find(({ root }) => root === configuration.root) && " · расширение"}
+        {structure && countAvailable && ` · объектов верхнего уровня: ${structure.objectsByRoot[configuration.root] ?? 0}`}
         {snapshot.configurations.length > 1 ? ` · ${configuration.root}` : ""}
       </li>)}</ul>}
-    {snapshot.configurations.length > 0 && <p className="dashboard-note">Расширения: контракт passport v1 не отдаёт состав расширений.</p>}
+    {structure && <p>
+      {countAvailable ? `Отслеживаемые модули BSL: ${structure.bslModules.toLocaleString()} · строк: ${structure.bslLines.toLocaleString()}` : "Модули и строки BSL: нет данных"}
+      {!counters.complete && countAvailable && " · данные неполные"}
+      {snapshot.configComplete && ` · расширений в исходниках: ${structure.extensions.length}`}
+    </p>}
     <p>
       {counters.complete || counters.trackedFiles > 0 || counters.trackedBytes > 0
         ? <>Отслеживаемые файлы: {counters.trackedFiles.toLocaleString()} · {formatBytes(counters.trackedBytes)}{counters.complete ? "" : " · данные неполные"}</>
@@ -745,7 +784,7 @@ function PassportDetails({ state }: { state: Loadable<PassportSnapshot | null> |
     </p>
     {counters.byExtension.length > 0 && <ul>{counters.byExtension.slice(0, 6).map(({ extension, bytes }) => <li key={extension}>{extension}: {formatBytes(bytes)}</li>)}</ul>}
     {counters.reason && <p className="dashboard-note">Причина неполного объёма: {counters.reason}</p>}
-    <p className="dashboard-note">Строки BSL и объекты метаданных: контракт passport v1 не отдаёт эти счётчики. Снимок: {new Date(snapshot.snapshotAt).toLocaleString("ru-RU")}</p>
+    <p className="dashboard-note">{!structure && "Расширенный паспорт недоступен. "}Снимок: {new Date(snapshot.snapshotAt).toLocaleString("ru-RU")}</p>
   </>;
 }
 
@@ -883,6 +922,29 @@ function CostDetails({ summary }: { summary: CostSummary }) {
     </li>)}</ul>}
     <p className="dashboard-note">Фактическая стоимость показывается только когда провайдер её передал; расчётных тарифов дашборд не подставляет.</p>
   </>;
+}
+
+function UsageHistoryDetails({ history }: { history: ProjectUsageHistory }) {
+  const rows = history.threads.flatMap((thread) => thread.turns.map((turn) => ({ ...turn, thread })))
+    .sort((a, b) => b.at - a.at);
+  const latest = history.threads.reduce((sum, row) => sum + (row.latest ?? 0), 0);
+  const undated = history.threads.reduce((sum, row) => sum + row.undated, 0);
+  const resets = history.threads.reduce((sum, row) => sum + row.resets, 0);
+  const withoutTurn = history.threads.reduce((sum, row) => sum + row.unattributedTurnTokens, 0);
+  return <details>
+    <summary>Токены по ходам</summary>
+    <p>История: {history.scanned} из {history.total} тредов{history.incomplete > 0 ? ` · с ограничениями: ${history.incomplete}` : ""}.</p>
+    {history.threads.some(({ latest }) => latest !== null) && <p>
+      Последние снимки в прочитанной истории: {formatTokens(latest)} · разнесено по дням {formatTokens(latest - undated)} · без даты {formatTokens(undated)}.
+      {resets > 0 && ` Смен счётчика: ${resets}. Календарь включает наблюдаемые начисления до смены.`}
+      {withoutTurn > 0 && ` Без привязки к ходу: ${formatTokens(withoutTurn)}.`}
+    </p>}
+    {rows.length ? <ul>{rows.slice(0, 30).map(({ at, tokens, turnId, thread }) => <li key={`${thread.threadId}:${turnId}`}>
+      {new Date(at).toLocaleString("ru-RU")} · {thread.title} · {formatTokens(tokens)} токенов
+      {thread.reviewer ? " · ревью 1С" : " · стадия не определена"}
+    </li>)}</ul> : <p>В прочитанной истории нет начислений, связанных с ходами.</p>}
+    {rows.length > 30 && <p>Показано 30 последних ходов из {rows.length}.</p>}
+  </details>;
 }
 
 function CostTaskItem({ row, depth }: { row: CostSummary["tasks"][number]; depth: number }) {

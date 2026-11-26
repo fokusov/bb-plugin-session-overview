@@ -17,8 +17,40 @@ import { summarizeTaskCost, type CostTask, type CostThread } from "../lib/dashbo
 import { operationSourceGit, reportFreshness, summarizeQuality, type OperationEntry } from "../lib/dashboard-quality.ts";
 import { passportSchema } from "../lib/passport.ts";
 import { operationActivityEvents, readProjectOperations, summarizeOpenSpec, taskActivityEvents } from "../lib/dashboard-data.ts";
+import { summarizeThreadHistory } from "../lib/dashboard-usage.ts";
+import type { AgentEvent } from "../lib/session-agents.ts";
 
 const at = (year: number, month: number, day: number, hour = 12) => new Date(year, month - 1, day, hour).getTime();
+
+test("observed deltas reconcile after resets, independently of turn coverage", () => {
+  const thread = { id: "t", projectId: "p", environmentId: "a", title: "Review", titleFallback: null, status: "idle",
+    displayStatus: null, parentThreadId: "parent", updatedAt: at(2026, 11, 25), providerId: "codex" };
+  const scope = (turnId?: string) => turnId ? { kind: "turn", turnId } : { kind: "thread" };
+  const token = (seq: number, totalTokens: number, turnId?: string, session = "a") => ({
+    seq, threadId: "t", createdAt: at(2026, 11, seq < 7 ? 24 : 25), scope: scope(turnId),
+    type: "thread/tokenUsage/updated",
+    data: { providerThreadId: session, tokenUsage: { total: { totalTokens } } },
+  });
+  const review = { seq: 5, threadId: "t", createdAt: at(2026, 11, 24), scope: scope("r1"), type: "turn/completed", data: { status: "completed" } };
+  const rows = [
+    token(1, 100, "prior"), token(3, 130, "r1"), token(3, 130, "r1"), token(4, 140),
+    review, { ...review, seq: 6 }, token(7, 8, "r2"), token(8, 12, "r2"),
+    token(11, 30, "r3", "b"), token(12, 40, "r3", "b"), { ...token(10, 10000), threadId: "other" },
+  ].reverse() as unknown as AgentEvent[];
+  const result = summarizeThreadHistory(rows, thread, true);
+  assert.equal(result.latest, 40);
+  assert.equal(result.undated, 30);
+  assert.equal(result.resets, 2);
+  assert.equal(result.unattributedTurnTokens, 10);
+  assert.deepEqual(result.turns.map(({ tokens }) => tokens), [30, 4, 10]);
+  assert.equal(result.events.filter(({ metric }) => metric === "reviews").length, 1);
+  assert.equal(result.events.filter(({ metric }) => metric === "turns").length, 1);
+  const calendar = buildCalendar(result.events, { metric: "tokens", projectId: "p", period: 2026 }, at(2026, 11, 26));
+  assert.equal(calendar.total, 54);
+  assert.deepEqual(calendar.cells.flat().filter((row) => row?.count).map((row) => row?.count), [40, 14]);
+  const clear = { ...review, seq: 13, type: "thread/context/cleared" } as unknown as AgentEvent;
+  assert.equal(summarizeThreadHistory([...rows, clear], thread, false).latest, null);
+});
 
 test("compares operation revisions against the selected checkout or an exact default source", () => {
   const sources = [{ id: "src", hostId: "local", path: "C:\\Repo\\", isDefault: true }];
@@ -146,7 +178,7 @@ test("подгрузка страницы истории не дублирует
 test("фильтры и закрепления переживают возврат и не ломаются от старых значений", () => {
   const filters = parseDashboardFilters({ period: 2025, metric: "commits", projectId: "p1", day: "2025-03-04" });
   assert.deepEqual(filters, { period: 2025, metric: "commits", projectId: "p1", day: "2025-03-04" });
-  assert.deepEqual(parseDashboardFilters({ period: 1990, metric: "turns", projectId: 5, day: "вчера" }), {
+  assert.deepEqual(parseDashboardFilters({ period: 1990, metric: "obsolete", projectId: 5, day: "вчера" }), {
     period: "last12", metric: "threads", projectId: null, day: null,
   });
   assert.deepEqual(parseDashboardFilters(serializeDashboardFilters(filters)), filters);
