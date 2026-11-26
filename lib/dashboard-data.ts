@@ -5,7 +5,7 @@
  * - BB SDK threads and environments for project work and activity days;
  * - `bb--git.workspaceStatus` for branch and changed files;
  * - `1c-properties.passport` for the configuration passport and source volume;
- * - `1c-properties.platformDashboardV1` for operations, tests and revisions;
+ * - `1c-properties.platformDashboardV2` for operations, tests, revisions and diagnostics;
  * - `git-history` for commits (optional plugin, read-only RPC);
  * - `tasks` for BB Tasks and thread links;
  * - `openspec-bsl-flow` for OpenSpec changes, BSL Flow stages and blockers.
@@ -19,7 +19,7 @@ import type { useSdk } from "@get-bb/plugin-sdk/app";
 import type { ActivityEvent } from "./dashboard-activity.ts";
 import { localDay } from "./dashboard-activity.ts";
 import type { CostTask, CostThread, TaskLink } from "./dashboard-cost.ts";
-import type { OperationEntry } from "./dashboard-quality.ts";
+import type { OperationEntry, OperationReport, WorkspaceQuality } from "./dashboard-quality.ts";
 import { isBuildAction } from "./dashboard-quality.ts";
 import type { DashboardThread } from "./dashboard-types.ts";
 import type { PassportSnapshot } from "./passport.ts";
@@ -211,35 +211,6 @@ export async function readProjectCommits(
   return { value: events, complete, error: errors.length > 0 ? errors.join("; ") : null };
 }
 
-const historyRevisionSchema = z.object({ revision: z.string(), unavailableReason: z.string().nullable() });
-
-/** Current source revision of the project's first repository, used to compare reports with sources. */
-export async function readProjectRevision(sdk: Sdk, threads: readonly DashboardThread[], signal: AbortSignal): Promise<string | null> {
-  const latest = threads.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  if (!latest) return null;
-  try {
-    const repositories = repositoriesSchema.parse(await sdk.plugins.callRpc({
-      pluginId: "git-history",
-      method: "repositories",
-      input: { threadId: latest.id },
-      outputSchema: repositoriesSchema,
-      signal: bounded(signal, 5_000),
-    }));
-    const repository = repositories.repositories[0];
-    if (!repository) return null;
-    const revision = historyRevisionSchema.parse(await sdk.plugins.callRpc({
-      pluginId: "git-history",
-      method: "historyRevision",
-      input: { threadId: latest.id, repositoryKey: repository.key },
-      outputSchema: historyRevisionSchema,
-      signal: bounded(signal, 5_000),
-    }));
-    return revision.unavailableReason ? null : revision.revision;
-  } catch {
-    return null;
-  }
-}
-
 const taskListSchema = z.object({
   projects: z.array(z.object({ id: z.string(), name: z.string(), linkedBbProjectId: z.string().nullable() })),
 });
@@ -406,34 +377,70 @@ export async function readProjectOpenSpec(sdk: Sdk, projectId: string, signal: A
   }
 }
 
-const operationCountsSchema = z.object({ tests: z.number(), failures: z.number(), errors: z.number(), skipped: z.number() });const operationSchema = z.object({
+const operationCountsSchema = z.object({ tests: z.number(), failures: z.number(), errors: z.number(), skipped: z.number() });
+const operationReportSchema = z.object({ id: z.string(), name: z.string() });
+const operationSchema = z.object({
   id: z.string(), action: z.string(), profile: z.string(), kind: z.string(),
   state: z.enum(["running", "launched", "done", "failed", "cancelled", "interrupted"]),
   startedAt: z.string(), finishedAt: z.string().nullable(),
   revision: z.string().nullable(), dirty: z.boolean().nullable(), needsInspection: z.boolean(),
   counts: operationCountsSchema.nullable(),
-  reports: z.array(z.object({ id: z.string(), name: z.string() })),
+  reports: z.array(operationReportSchema),
 });
 export const platformDashboardSchema = z.object({ version: z.literal(1), entries: z.array(operationSchema) });
+const platformDashboardV2Schema = z.object({
+  version: z.literal(2),
+  entries: z.array(operationSchema.extend({ platformVersion: z.string().nullable() })),
+  diagnostics: z.array(z.object({
+    tool: z.enum(["bsl-ls", "apk"]),
+    profile: z.string(),
+    finishedAt: z.iso.datetime(),
+    revision: z.string().nullable(),
+    counts: z.object({ errors: z.number().int().nonnegative(), warnings: z.number().int().nonnegative().nullable(), total: z.number().int().nonnegative() }),
+    report: operationReportSchema,
+  })).max(4),
+});
 
 export async function readProjectOperations(
   sdk: Sdk,
   projectId: string,
   signal: AbortSignal,
   environmentId?: string,
-): Promise<ReadResult<OperationEntry[]>> {
+): Promise<ReadResult<WorkspaceQuality>> {
+  const request = { pluginId: "1c-properties", input: { projectId, ...(environmentId ? { environmentId } : {}) }, signal: bounded(signal) };
   try {
-    const payload = platformDashboardSchema.parse(await sdk.plugins.callRpc({
-      pluginId: "1c-properties",
-      method: "platformDashboardV1",
-      input: { projectId, ...(environmentId ? { environmentId } : {}) },
-      outputSchema: platformDashboardSchema,
-      signal,
-    }));
-    return { value: payload.entries.slice(0, OPERATION_LIMIT), complete: payload.entries.length <= OPERATION_LIMIT, error: null };
+    let entries: OperationEntry[];
+    let diagnostics: WorkspaceQuality["diagnostics"] = null;
+    try {
+      const payload = await sdk.plugins.callRpc({ ...request, method: "platformDashboardV2", outputSchema: platformDashboardV2Schema });
+      ({ entries, diagnostics } = payload);
+    } catch (cause) {
+      if (!cause || typeof cause !== "object" || !("code" in cause) || cause.code !== "unknown_method") throw cause;
+      ({ entries } = await sdk.plugins.callRpc({ ...request, method: "platformDashboardV1", outputSchema: platformDashboardSchema }));
+    }
+    return { value: { entries: entries.slice(0, OPERATION_LIMIT), diagnostics }, complete: entries.length <= OPERATION_LIMIT, error: null };
   } catch (cause) {
-    return { value: [], complete: false, error: message(cause) };
+    return { value: { entries: [], diagnostics: null }, complete: false, error: message(cause) };
   }
+}
+
+const platformArtifactSchema = z.object({ text: z.string() });
+
+export function readProjectOperationArtifact(
+  sdk: Sdk, scope: { projectId: string; environmentId: string | null }, report: OperationReport, signal: AbortSignal,
+) {
+  return sdk.plugins.callRpc({
+    pluginId: "1c-properties",
+    method: "platformArtifact",
+    input: {
+      projectId: scope.projectId,
+      ...(scope.environmentId ? { environmentId: scope.environmentId } : {}),
+      id: report.id,
+      name: report.name,
+    },
+    outputSchema: platformArtifactSchema,
+    signal: bounded(signal),
+  });
 }
 
 export function operationActivityEvents(entries: readonly OperationEntry[], projectId: string): ActivityEvent[] {

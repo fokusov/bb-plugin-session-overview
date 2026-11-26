@@ -1,11 +1,31 @@
 /**
  * Quality, test and operation rows for one project.
  *
- * Source: the read-only `1c-properties.platformDashboardV1` contract. It
- * carries the profile, state, recorded revision and test counts. A report is
- * fresh only when it finished inside the freshness window and, when the current
- * source revision is known, matches it.
+ * A report is fresh when it finished inside the freshness window and matches
+ * the known current source revision.
  */
+
+import type { GitEnvironment } from "./dashboard-types.ts";
+import type { ProjectSource } from "./projects.ts";
+
+function comparableSourcePath(path: string): string {
+  if (/^(?:[a-z]:[\\/]|\\\\)/i.test(path)) return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return path.replace(/\/+$/, "") || "/";
+}
+
+export function operationSourceGit<T extends Pick<GitEnvironment, "id" | "hostId" | "path">>(
+  environments: readonly T[],
+  sources: readonly ProjectSource[],
+  environmentId: string | null,
+): T | undefined {
+  if (environmentId) return environments.find(({ id }) => id === environmentId);
+  const source = sources.find(({ isDefault }) => isDefault) ?? sources[0];
+  if (!source) return undefined;
+  const sourcePath = comparableSourcePath(source.path);
+  return environments.find(({ hostId, path }) =>
+    hostId === source.hostId && path !== null && comparableSourcePath(path) === sourcePath,
+  );
+}
 
 export interface OperationCounts {
   tests: number;
@@ -32,6 +52,21 @@ export interface OperationEntry {
   needsInspection: boolean;
   counts: OperationCounts | null;
   reports: OperationReport[];
+  platformVersion?: string | null;
+}
+
+export interface DiagnosticReport {
+  tool: "bsl-ls" | "apk";
+  profile: string;
+  finishedAt: string;
+  revision: string | null;
+  counts: { errors: number; warnings: number | null; total: number };
+  report: OperationReport;
+}
+
+export interface WorkspaceQuality {
+  entries: OperationEntry[];
+  diagnostics: DiagnosticReport[] | null;
 }
 
 export interface CountDelta {
@@ -73,10 +108,31 @@ export function isLoadAction(action: string): boolean {
   return loadActions.has(action);
 }
 
-function finishedAt(entry: OperationEntry): number | null {
+function finishedAt(entry: { finishedAt: string | null }): number | null {
   if (!entry.finishedAt) return null;
   const value = Date.parse(entry.finishedAt);
   return Number.isFinite(value) ? value : null;
+}
+
+export function reportFreshness(
+  report: { finishedAt: string | null; revision: string | null; dirty?: boolean | null },
+  sourceRevision?: string | null,
+  now = Date.now(),
+  windowMs = defaultFreshnessMs,
+  sourceDirty?: boolean | null,
+): { fresh: boolean | null; reason: string | null } {
+  const finished = finishedAt(report);
+  if (finished === null) return { fresh: false, reason: "Прогон ещё не завершён" };
+  if (finished > now) return { fresh: null, reason: "Время отчёта указано в будущем" };
+  if (now - finished > windowMs) return { fresh: false, reason: "Отчёт старше окна свежести" };
+  if (report.revision && sourceRevision && report.revision !== sourceRevision) {
+    return { fresh: false, reason: "Ревизия отчёта не совпадает с текущими исходниками" };
+  }
+  if (!report.revision) return { fresh: null, reason: "Ревизия отчёта не записана" };
+  if (report.dirty) return { fresh: null, reason: "Отчёт учитывал незакоммиченные изменения" };
+  if (!sourceRevision) return { fresh: null, reason: "Свежесть не определена: текущая ревизия недоступна" };
+  if (sourceDirty) return { fresh: null, reason: "В рабочей копии есть незакоммиченные изменения" };
+  return { fresh: true, reason: null };
 }
 
 function byRecency(a: OperationEntry, b: OperationEntry): number {
@@ -95,7 +151,7 @@ function delta(latest: OperationCounts | null, previous: OperationCounts | null)
 
 export function summarizeQuality(
   entries: readonly OperationEntry[],
-  options: { now?: number; sourceRevision?: string | null; freshAfterMs?: number } = {},
+  options: { now?: number; sourceRevision?: string | null; sourceDirty?: boolean | null; freshAfterMs?: number } = {},
 ): QualitySummary {
   const now = options.now ?? Date.now();
   const freshAfterMs = options.freshAfterMs ?? defaultFreshnessMs;
@@ -106,26 +162,7 @@ export function summarizeQuality(
     ? tests.find((entry) => entry.action === latestTest.action && entry.profile === latestTest.profile && entry.id !== latestTest.id) ?? null
     : null;
 
-  let testFresh: boolean | null = null;
-  let testStaleReason: string | null = null;
-  if (latestTest) {
-    const finished = finishedAt(latestTest);
-    if (finished === null) {
-      testFresh = false;
-      testStaleReason = "Прогон ещё не завершён";
-    } else if (now - finished > freshAfterMs) {
-      testFresh = false;
-      testStaleReason = "Отчёт старше окна свежести";
-    } else if (options.sourceRevision && latestTest.revision && latestTest.revision !== options.sourceRevision) {
-      testFresh = false;
-      testStaleReason = "Ревизия отчёта не совпадает с текущими исходниками";
-    } else if (!latestTest.revision) {
-      testFresh = null;
-      testStaleReason = "Ревизия отчёта не записана";
-    } else {
-      testFresh = true;
-    }
-  }
+  const testFreshness = latestTest ? reportFreshness(latestTest, options.sourceRevision, now, freshAfterMs, options.sourceDirty) : null;
 
   const latestBuild = ordered.find((entry) => isBuildAction(entry.action) && (entry.state === "done" || entry.state === "failed")) ?? null;
   const latestLoad = ordered.find((entry) => isLoadAction(entry.action)) ?? null;
@@ -141,8 +178,8 @@ export function summarizeQuality(
     latestTest,
     previousTest,
     testDelta: delta(latestTest?.counts ?? null, previousTest?.counts ?? null),
-    testFresh,
-    testStaleReason,
+    testFresh: testFreshness?.fresh ?? null,
+    testStaleReason: testFreshness?.reason ?? null,
     latestBuild,
     latestLoad,
     confirmedLoadRevision,

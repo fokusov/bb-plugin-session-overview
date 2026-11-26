@@ -275,6 +275,7 @@
 
 .dashboard-cost-tasks { display: flex; flex-direction: column; gap: 2px; }
 .dashboard-quality { display: flex; flex-direction: column; gap: 4px; }
+.dashboard-report { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .dashboard-coverage { display: grid; gap: 2px; padding-inline-start: 0; list-style: none; font-size: 12px; opacity: .85; }
 

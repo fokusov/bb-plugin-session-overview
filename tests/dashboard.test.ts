@@ -14,11 +14,57 @@ import { parseDashboardFilters, parsePinnedProjects, serializeDashboardFilters }
 import { isDefaultVisible, selectProjectCards, summarizeSourceCounters, togglePinned, type ProjectCard } from "../lib/dashboard-projects.ts";
 import { buildProjectThreadForest, flattenThreadForest, type ProjectThreadRow } from "../lib/dashboard-threads.ts";
 import { summarizeTaskCost, type CostTask, type CostThread } from "../lib/dashboard-cost.ts";
-import { summarizeQuality, type OperationEntry } from "../lib/dashboard-quality.ts";
+import { operationSourceGit, reportFreshness, summarizeQuality, type OperationEntry } from "../lib/dashboard-quality.ts";
 import { passportSchema } from "../lib/passport.ts";
-import { operationActivityEvents, summarizeOpenSpec, taskActivityEvents } from "../lib/dashboard-data.ts";
+import { operationActivityEvents, readProjectOperations, summarizeOpenSpec, taskActivityEvents } from "../lib/dashboard-data.ts";
 
 const at = (year: number, month: number, day: number, hour = 12) => new Date(year, month - 1, day, hour).getTime();
+
+test("compares operation revisions against the selected checkout or an exact default source", () => {
+  const sources = [{ id: "src", hostId: "local", path: "C:\\Repo\\", isDefault: true }];
+  const main = { id: "root", hostId: "local", path: "c:/repo", headSha: "main" };
+  const a = { id: "a", hostId: "local", path: "C:/repo-a", headSha: "rev-a" };
+  const b = { id: "b", hostId: "local", path: "C:/repo-b", headSha: "rev-b" };
+  const otherMachine = { ...main, id: "remote", hostId: "remote", headSha: "unrelated" };
+  assert.equal(operationSourceGit([b, a, main], sources, "a"), a);
+  assert.equal(operationSourceGit([main, a, b], sources, "b"), b);
+  assert.equal(operationSourceGit([otherMachine, a, main], sources, null), main);
+  assert.equal(operationSourceGit([otherMachine, a, b], sources, null), undefined);
+  assert.equal(operationSourceGit([main, a], sources, "b"), undefined);
+});
+
+test("отчёт диагностики свежий только при совпавшей зафиксированной ревизии", () => {
+  const now = Date.parse("2026-11-25T12:00:00.000Z");
+  const report = { finishedAt: "2026-11-24T12:00:00.000Z", revision: "a" };
+  assert.equal(reportFreshness(report, "a", now).fresh, true);
+  assert.equal(reportFreshness(report, "b", now).fresh, false);
+  assert.equal(reportFreshness(report, null, now).fresh, null);
+  assert.equal(reportFreshness({ ...report, revision: null }, "a", now).fresh, null);
+  assert.equal(reportFreshness(report, "a", now, undefined, true).fresh, null);
+});
+
+test("журнал v1 загружается только если метод v2 отсутствует", async () => {
+  for (const code of ["unknown_method", "handler_error"]) {
+    const methods: string[] = [];
+    const scope = { projectId: "p", environmentId: "a" };
+    const callRpc = async ({ method, input }: { method: string; input: unknown }) => {
+      assert.deepEqual(input, scope);
+      methods.push(method);
+      if (method === "platformDashboardV2") throw Object.assign(new Error("v2 failure"), { code });
+      return { version: 1, entries: [] };
+    };
+    const sdk = { plugins: { callRpc } } as unknown as Parameters<typeof readProjectOperations>[0];
+    const result = await readProjectOperations(sdk, scope.projectId, new AbortController().signal, scope.environmentId);
+    assert.deepEqual(result.value, { entries: [], diagnostics: null });
+    if (code === "unknown_method") {
+      assert.equal(result.error, null);
+      assert.deepEqual(methods, ["platformDashboardV2", "platformDashboardV1"]);
+    } else {
+      assert.equal(result.error, "v2 failure");
+      assert.deepEqual(methods, ["platformDashboardV2"]);
+    }
+  }
+});
 
 function event(overrides: Partial<ActivityEvent> & Pick<ActivityEvent, "id" | "at">): ActivityEvent {
   return {
@@ -282,6 +328,10 @@ test("свежесть отчёта, сравнение прогонов и ра
   assert.equal(stale.testFresh, false);
   assert.match(stale.testStaleReason ?? "", /старше/);
   assert.equal(stale.testDelta, null);
+
+  const unknown = summarizeQuality([operation({ id: "new", action: "yaxunit", finishedAt: "2026-11-24T10:05:00.000Z" })], { now });
+  assert.equal(unknown.testFresh, null);
+  assert.match(unknown.testStaleReason ?? "", /текущая ревизия недоступна/);
 });
 
 test("после неудачной загрузки состояние базы остаётся неподтверждённым", () => {

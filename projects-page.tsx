@@ -32,18 +32,22 @@ import {
 import { buildProjectThreadForest, flattenThreadForest, threadTitle, type ProjectThreadRow } from "./lib/dashboard-threads.js";
 import {
   operationActionLabels,
+  operationSourceGit,
   operationStateLabels,
+  reportFreshness,
   summarizeQuality,
-  type OperationEntry,
+  type DiagnosticReport,
+  type OperationReport,
   type QualitySummary,
+  type WorkspaceQuality,
 } from "./lib/dashboard-quality.js";
 import {
   readDashboardThreads,
   readProjectCommits,
   readProjectOpenSpec,
+  readProjectOperationArtifact,
   readProjectOperations,
   readProjectPassport,
-  readProjectRevision,
   readProjectTasks,
   readProjectUsage,
   taskActivityEvents,
@@ -114,6 +118,8 @@ async function readGitEnvironments(sdk: Sdk, projectId: string, environments: re
     const base = {
       projectId,
       id: environment.id,
+      hostId: environment.hostId,
+      path: environment.path,
       name: environment.name,
       isWorktree: environment.isWorktree,
       branchName: environment.branchName,
@@ -130,18 +136,19 @@ async function readGitEnvironments(sdk: Sdk, projectId: string, environments: re
       if (summary.outcome === "available") return {
         ...base,
         outcome: "available",
+        headSha: result.outcome === "available" ? result.workspace.checkout?.headSha ?? null : null,
         branch: summary.branch,
         changedFiles: summary.changedFiles,
         hasUncommittedChanges: summary.dirty,
       };
-      return { ...base, outcome: summary.outcome, branch: null, changedFiles: null, hasUncommittedChanges: null };
+      return { ...base, outcome: summary.outcome, headSha: null, branch: null, changedFiles: null, hasUncommittedChanges: null };
     } catch {
-      return { ...base, outcome: "error", branch: null, changedFiles: null, hasUncommittedChanges: null };
+      return { ...base, outcome: "error", headSha: null, branch: null, changedFiles: null, hasUncommittedChanges: null };
     }
   }));
 }
 
-function passportKey(projectId: string, environmentId: string | null): string {
+function workspaceKey(projectId: string, environmentId: string | null): string {
   return `${projectId}\u0000${environmentId ?? ""}`;
 }
 
@@ -158,8 +165,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
   const [passports, setPassports] = useState<Record<string, Loadable<PassportSnapshot | null>>>({});
   const [tasks, setTasks] = useState<Record<string, ProjectTasks>>({});
   const [openSpec, setOpenSpec] = useState<Record<string, ReadResult<OpenSpecSummary | null>>>({});
-  const [operations, setOperations] = useState<Record<string, ReadResult<OperationEntry[]>>>({});
-  const [revisions, setRevisions] = useState<Record<string, string | null>>({});
+  const [workspaceOperations, setWorkspaceOperations] = useState<Record<string, ReadResult<WorkspaceQuality> | undefined>>({});
   const [usage, setUsage] = useState<Record<string, Loadable<CostSummary>>>({});
   const [filters, setFilters] = useState<DashboardFilters>(initialFilters);
   const [pinned, setPinned] = useState<string[]>(initialPins);
@@ -196,20 +202,6 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
     for (const controller of passportAborts.current.values()) controller.abort();
   }, []);
 
-  useEffect(() => {
-    if (!projects || threads.value.length === 0) return;
-    const controller = new AbortController();
-    for (const project of projects) {
-      const rows = threads.value.filter((thread) => thread.projectId === project.id);
-      if (rows.length === 0) continue;
-      void readProjectRevision(sdk, rows, controller.signal)
-        .then((revision) => {
-          if (!controller.signal.aborted) setRevisions((current) => ({ ...current, [project.id]: revision }));
-        });
-    }
-    return () => controller.abort();
-  }, [projects, threads, sdk]);
-
   // Per-project sources. Each read is independent: one failing source keeps the card usable.
   useEffect(() => {
     const controller = new AbortController();
@@ -224,10 +216,10 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
           if (!controller.signal.aborted) setGitErrors((current) => ({ ...current, [project.id]: errorText(cause) }));
         }
         const selected = selectedEnvironment[project.id] ?? null;
+        const key = workspaceKey(project.id, selected);
         void readProjectPassport(sdk, project.id, controller.signal, selected ?? undefined)
           .then((result) => {
             if (controller.signal.aborted) return;
-            const key = passportKey(project.id, selected);
             setPassports((current) => ({
               ...current,
               [key]: result.error ? { status: "error", error: result.error } : { status: "ready", value: result.value },
@@ -238,7 +230,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
         void readProjectOpenSpec(sdk, project.id, controller.signal, selected ?? undefined)
           .then((value) => { if (!controller.signal.aborted) setOpenSpec((current) => ({ ...current, [project.id]: value })); });
         void readProjectOperations(sdk, project.id, controller.signal, selected ?? undefined)
-          .then((value) => { if (!controller.signal.aborted) setOperations((current) => ({ ...current, [project.id]: value })); });
+          .then((value) => { if (!controller.signal.aborted) setWorkspaceOperations((current) => ({ ...current, [key]: value })); });
         if (list.length > 0) {
           void readGitEnvironments(sdk, project.id, list, controller.signal)
             .then((rows) => { if (!controller.signal.aborted) setGitEnvironments((current) => ({ ...current, [project.id]: rows })); })
@@ -247,7 +239,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
       })();
     }
     return () => controller.abort();
-    // selectedEnvironment intentionally only seeds the first read; changing a worktree reloads the passport below.
+    // selectedEnvironment seeds the initial reads. Selecting a worktree reloads its data below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projects, sdk, refreshKey]);
 
@@ -297,11 +289,15 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
   }), [projects, projectThreads, openSpec, pinned, usage]);
 
   const visibleCards = useMemo(() => selectProjectCards(cards, { query, showAll, sort }), [cards, query, showAll, sort]);
+  const operations = useMemo(() => Object.fromEntries((projects ?? []).flatMap(({ id }) => {
+    const result = workspaceOperations[workspaceKey(id, selectedEnvironment[id] ?? null)];
+    return result ? [[id, result] as const] : [];
+  })), [projects, selectedEnvironment, workspaceOperations]);
 
   const activityEvents = useMemo(() => {
     const list: ActivityEvent[] = [...threadActivityEvents(threads.value)];
     for (const [projectId, projectTasks] of Object.entries(tasks)) list.push(...taskActivityEvents(projectTasks.tasks, projectId));
-    for (const [projectId, result] of Object.entries(operations)) list.push(...operationActivityEvents(result.value, projectId));
+    for (const [projectId, result] of Object.entries(operations)) list.push(...operationActivityEvents(result.value.entries, projectId));
     if (commits.status === "ready") list.push(...commits.events);
     return dedupeCommits(list).events.sort((a, b) => b.at - a.at || a.id.localeCompare(b.id));
   }, [threads, tasks, operations, commits]);
@@ -356,8 +352,9 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
 
   const selectEnvironment = (projectId: string, environmentId: string | null) => {
     setSelectedEnvironment((current) => ({ ...current, [projectId]: environmentId }));
-    const key = passportKey(projectId, environmentId);
+    const key = workspaceKey(projectId, environmentId);
     setPassports((current) => ({ ...current, [key]: { status: "loading" } }));
+    setWorkspaceOperations((current) => ({ ...current, [key]: undefined }));
     passportAborts.current.get(projectId)?.abort();
     const controller = new AbortController();
     passportAborts.current.set(projectId, controller);
@@ -370,7 +367,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
         }));
       });
     void readProjectOperations(sdk, projectId, controller.signal, environmentId ?? undefined)
-      .then((result) => { if (!controller.signal.aborted) setOperations((current) => ({ ...current, [projectId]: result })); });
+      .then((result) => { if (!controller.signal.aborted) setWorkspaceOperations((current) => ({ ...current, [key]: result })); });
     void readProjectOpenSpec(sdk, projectId, controller.signal, environmentId ?? undefined)
       .then((result) => { if (!controller.signal.aborted) setOpenSpec((current) => ({ ...current, [projectId]: result })); });
   };
@@ -474,7 +471,7 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
       <ul className="dashboard-coverage" aria-label="Охват источников">        <li>Треды: {threads.value.length} видимых · история {threads.complete ? "полная" : `ограничена первыми ${THREAD_SCAN_LIMIT.toLocaleString()}`}</li>
         <li>Коммиты: {!filters.projectId ? "выберите проект, чтобы загрузить коммиты" : commitThreads.length === 0 ? "у проекта нет видимых тредов и окружений" : commits.status === "ready" ? `${commits.events.length}${commits.complete ? "" : " · частично"}` : commits.status === "error" ? "недоступны" : filters.metric === "commits" ? "загружаются…" : "загружаются при выборе метрики"}</li>
         <li>Задачи BB Tasks: {Object.values(tasks).reduce((sum, projectTasks) => sum + projectTasks.tasks.length, 0)}</li>
-        <li>Операции 1С: {Object.values(operations).reduce((sum, result) => sum + result.value.length, 0)}</li>
+        <li>Операции 1С: {Object.values(operations).reduce((sum, result) => sum + result.value.entries.length, 0)}</li>
       </ul>
       {!threads.complete && threads.error === null && <p role="status">История тредов ограничена первыми {THREAD_SCAN_LIMIT.toLocaleString()}; календарь и лента неполные.</p>}
       {threads.error && <p role="status">История тредов недоступна: {threads.error}</p>}
@@ -535,10 +532,12 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
         {visibleCards.map((card) => {
           const project = projects!.find(({ id }) => id === card.id)!;
           const selectedEnv = selectedEnvironment[project.id] ?? null;
-          const passportResult = passports[passportKey(project.id, selectedEnv)];
+          const passportResult = passports[workspaceKey(project.id, selectedEnv)];
           const projectTasks = tasks[project.id];
           const openspec = openSpec[project.id];
           const operationResult = operations[project.id];
+          const git = gitEnvironments[project.id] ?? [];
+          const operationGit = operationSourceGit(git, project.sources, selectedEnv);
           const usageState = usage[project.id];
           const rows = projectThreads.get(project.id) ?? [];
           return <ProjectCardView
@@ -547,13 +546,14 @@ export function ProjectsPage(_props: PluginNavPanelProps) {
             card={card}
             selectedEnvironmentId={selectedEnv}
             environments={environments[project.id] ?? []}
-            git={gitEnvironments[project.id] ?? []}
+            git={git}
             gitError={gitErrors[project.id] ?? null}
             passport={passportResult}
             tasks={projectTasks}
             openSpec={openspec}
             operations={operationResult}
-            revision={revisions[project.id] ?? null}
+            revision={operationGit?.headSha ?? null}
+            sourceDirty={operationGit?.hasUncommittedChanges ?? null}
             usage={usageState}
             commitCount={commits.status === "ready" ? commits.events.filter((event) => event.projectId === project.id).length : null}
             threads={rows}
@@ -580,7 +580,8 @@ function ProjectCardView(props: {
   passport: Loadable<PassportSnapshot | null> | undefined;
   tasks: ProjectTasks | undefined;
   openSpec: ReadResult<OpenSpecSummary | null> | undefined;
-  operations: ReadResult<OperationEntry[]> | undefined;
+  operations: ReadResult<WorkspaceQuality> | undefined;
+  sourceDirty: boolean | null;
   revision: string | null;
   usage: Loadable<CostSummary> | undefined;
   commitCount: number | null;
@@ -607,7 +608,9 @@ function ProjectCardView(props: {
     taskLabel: props.taskLabelByThread.get(thread.id) ?? null,
   }))), [threads, props.taskLabelByThread]);
   const flat = flattenThreadForest(forest);
-  const quality = useMemo(() => operations ? summarizeQuality(operations.value, { freshAfterMs: DEFAULT_FRESHNESS_MS, sourceRevision: props.revision }) : null, [operations, props.revision]);
+  const quality = useMemo(() => operations ? summarizeQuality(operations.value.entries, {
+    freshAfterMs: DEFAULT_FRESHNESS_MS, sourceRevision: props.revision, sourceDirty: props.sourceDirty,
+  }) : null, [operations, props.revision, props.sourceDirty]);
 
   return <article className="dashboard-card">
     <header className="dashboard-card-head">
@@ -683,7 +686,8 @@ function ProjectCardView(props: {
         </section>
       </div>
 
-      <QualityDetails quality={quality} operations={operations} />
+      <QualityDetails quality={quality} operations={operations} projectId={project.id} environmentId={props.selectedEnvironmentId}
+        sourceRevision={props.revision} sourceDirty={props.sourceDirty} />
 
       <section aria-label="Расход проекта">
         <div className="dashboard-panel-head">
@@ -745,17 +749,25 @@ function PassportDetails({ state }: { state: Loadable<PassportSnapshot | null> |
   </>;
 }
 
-function QualityDetails({ quality, operations }: { quality: QualitySummary | null; operations: ReadResult<OperationEntry[]> | undefined }) {
+function QualityDetails({ quality, operations, projectId, environmentId, sourceRevision, sourceDirty }: {
+  quality: QualitySummary | null;
+  operations: ReadResult<WorkspaceQuality> | undefined;
+  projectId: string;
+  environmentId: string | null;
+  sourceRevision: string | null;
+  sourceDirty: boolean | null;
+}) {
   if (!operations) return <section aria-label="Качество и операции"><h4>Качество и операции</h4><p>Загружаю журнал операций…</p></section>;
   if (operations.error) return <section aria-label="Качество и операции"><h4>Качество и операции</h4><p role="status">Журнал операций 1С недоступен: {operations.error}</p></section>;
-  if (!quality || quality.entries.length === 0) return <section aria-label="Качество и операции"><h4>Качество и операции</h4><p>Журнал операций пуст.</p></section>;
-  const test = quality.latestTest;
-  const load = quality.latestLoad;
+  const test = quality?.latestTest;
+  const load = quality?.latestLoad;
+  const diagnostics = operations.value.diagnostics;
   return <section aria-label="Качество и операции">
     <h4>Качество и операции</h4>
-    {test ? <div className="dashboard-quality">
+    {test && quality ? <div className="dashboard-quality">
       <p>
         {operationActionLabels[test.action] ?? test.action} · профиль {test.profile} · {operationStateLabels[test.state] ?? test.state}
+        {test.platformVersion ? ` · платформа ${test.platformVersion}` : ""}
         {test.counts ? ` · тестов ${test.counts.tests}, сбоев ${test.counts.failures}, ошибок ${test.counts.errors}, пропущено ${test.counts.skipped}` : ""}
       </p>
       <p className={quality.testFresh === false ? "dashboard-warning" : "dashboard-note"}>
@@ -768,18 +780,87 @@ function QualityDetails({ quality, operations }: { quality: QualitySummary | nul
         {quality.previousTest.counts ? ` · тестов ${quality.previousTest.counts.tests}, сбоев ${quality.previousTest.counts.failures}, ошибок ${quality.previousTest.counts.errors}, пропущено ${quality.previousTest.counts.skipped}` : ""}
         {quality.previousTest.revision ? ` · ревизия ${quality.previousTest.revision}` : ""}
       </p>}
-      {test.reports.length > 0 && <ul>{test.reports.map((report) => <li key={`${report.id}-${report.name}`}>{report.name} · запуск {report.id.slice(0, 8)}</li>)}</ul>}
-    </div> : <p>Результатов тестов и проверок нет.</p>}
-    {!test && <p className="dashboard-note">Диагностика BSL LS и АПК: публичного контракта отчёта с ревизией пока нет.</p>}
-    {quality.latestBuild && <p>Последняя сборка: {operationActionLabels[quality.latestBuild.action] ?? quality.latestBuild.action} · {operationStateLabels[quality.latestBuild.state] ?? quality.latestBuild.state} · {new Date(quality.latestBuild.finishedAt ?? quality.latestBuild.startedAt).toLocaleString("ru-RU")}</p>}
+      {test.reports.length > 0 && <OperationReports
+        key={`${workspaceKey(projectId, environmentId)}:${test.id}`}
+        reports={test.reports} projectId={projectId} environmentId={environmentId}
+      />}
+    </div> : <p>{quality?.entries.length ? "Результатов тестов и проверок нет." : "Журнал операций пуст."}</p>}
+    {diagnostics === null ? <p className="dashboard-note">BSL LS и АПК доступны в 1c-properties с контрактом операций v2.</p>
+      : <DiagnosticDetails diagnostics={diagnostics} projectId={projectId} environmentId={environmentId}
+        sourceRevision={sourceRevision} sourceDirty={sourceDirty} />}
+    {quality?.latestBuild && <p>Последняя сборка: {operationActionLabels[quality.latestBuild.action] ?? quality.latestBuild.action} · {operationStateLabels[quality.latestBuild.state] ?? quality.latestBuild.state} · {new Date(quality.latestBuild.finishedAt ?? quality.latestBuild.startedAt).toLocaleString("ru-RU")}</p>}
     {load && <p>
       Последняя загрузка: {operationActionLabels[load.action] ?? load.action} · профиль {load.profile} · {operationStateLabels[load.state] ?? load.state}
-      {quality.confirmedLoadRevision ? ` · ревизия по журналу ${quality.confirmedLoadRevision}` : " · ревизия базы не подтверждена"}
+      {load.platformVersion ? ` · платформа ${load.platformVersion}` : " · версия платформы неизвестна"}
+      {quality?.confirmedLoadRevision ? ` · ревизия по журналу ${quality.confirmedLoadRevision}` : " · ревизия базы не подтверждена"}
       {load.needsInspection ? " · требуется проверка состояния базы" : ""}
     </p>}
-    {quality.revisionMismatch && <p className="dashboard-warning" role="status">Исходники разошлись с базой: загружена ревизия {quality.revisionMismatch.loaded}, текущая {quality.revisionMismatch.source}.</p>}
+    {quality?.revisionMismatch && <p className="dashboard-warning" role="status">Исходники разошлись с базой: загружена ревизия {quality.revisionMismatch.loaded}, текущая {quality.revisionMismatch.source}.</p>}
     <UrlLink href="/plugins/1c-properties/projects">Открыть операции 1С</UrlLink>
   </section>;
+}
+
+const diagnosticTools = { "bsl-ls": "BSL LS", apk: "АПК" } as const;
+
+function DiagnosticDetails({ diagnostics, projectId, environmentId, sourceRevision, sourceDirty }: {
+  diagnostics: DiagnosticReport[];
+  projectId: string;
+  environmentId: string | null;
+  sourceRevision: string | null;
+  sourceDirty: boolean | null;
+}) {
+  return Object.entries(diagnosticTools).map(([tool, label]) => {
+    const [latest, previous] = diagnostics.filter((report) => report.tool === tool);
+    if (!latest) return <p key={tool} className="dashboard-note">{label} · отчёт ещё не импортирован.</p>;
+    const { fresh, reason } = reportFreshness(latest, sourceRevision, Date.now(), DEFAULT_FRESHNESS_MS, sourceDirty);
+    const { counts } = latest;
+    return <div key={tool} className="dashboard-quality">
+      <p>{label} · профиль {latest.profile} · {new Date(latest.finishedAt).toLocaleString("ru-RU")}
+        {tool === "apk" ? ` · проверок ${counts.total}, сбоев ${counts.errors}` : ` · замечаний ${counts.total}, ошибок ${counts.errors}, предупреждений ${counts.warnings}`}
+      </p>
+      <p className={fresh === false ? "dashboard-warning" : "dashboard-note"}>
+        {fresh === true ? "Отчёт свежий" : fresh === false ? `Отчёт устарел: ${reason}` : reason}
+        {latest.revision ? ` · ревизия ${latest.revision}` : ""}
+      </p>
+      {previous?.profile === latest.profile && <p>{tool === "apk" ? "Изменение числа сбоев" : "Изменение числа замечаний"}: {signed(tool === "apk" ? counts.errors - previous.counts.errors : counts.total - previous.counts.total)}</p>}
+      <OperationReports key={`${workspaceKey(projectId, environmentId)}:${latest.report.id}`}
+        reports={[latest.report]} projectId={projectId} environmentId={environmentId} />
+    </div>;
+  });
+}
+
+function OperationReports({ reports, projectId, environmentId }: {
+  reports: readonly OperationReport[];
+  projectId: string;
+  environmentId: string | null;
+}) {
+  const sdk = useSdk();
+  const request = useRef<AbortController | null>(null);
+  const [report, setReport] = useState<{ name: string; content: Loadable<string> } | null>(null);
+  useEffect(() => () => request.current?.abort(), []);
+
+  const openReport = (item: OperationReport) => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setReport({ name: item.name, content: { status: "loading" } });
+    void readProjectOperationArtifact(sdk, { projectId, environmentId }, item, controller.signal)
+      .then(({ text }) => {
+        if (!controller.signal.aborted) setReport({ name: item.name, content: { status: "ready", value: text } });
+      })
+      .catch((cause: unknown) => {
+        if (!controller.signal.aborted) setReport({ name: item.name, content: { status: "error", error: errorText(cause) } });
+      });
+  };
+
+  return <>
+    <ul>{reports.map((item) => <li key={`${item.id}-${item.name}`}>
+      <button type="button" onClick={() => openReport(item)}>{item.name}</button> · запуск {item.id.slice(0, 8)}
+    </li>)}</ul>
+    {report?.content.status === "loading" && <p role="status">Загружаю {report.name}…</p>}
+    {report?.content.status === "error" && <p role="status">{report.name} недоступен: {report.content.error}</p>}
+    {report?.content.status === "ready" && <pre className="dashboard-report" aria-label={report.name}>{report.content.value}</pre>}
+  </>;
 }
 
 function signed(value: number): string {

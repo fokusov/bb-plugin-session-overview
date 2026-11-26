@@ -13,6 +13,7 @@ export const workspaceStatusSchema = z.discriminatedUnion("outcome", [
         state: z.string(),
       }).passthrough(),
       branch: z.object({ currentBranch: z.string().nullable(), defaultBranch: z.string() }).passthrough(),
+      checkout: z.object({ headSha: z.string().min(1).nullable().optional() }).optional(),
     }).passthrough(),
   }).passthrough(),
   z.object({ outcome: z.literal("not_applicable"), reason: z.literal("non_git_environment"), message: z.string().min(1) }).passthrough(),

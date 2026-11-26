@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-session-overview",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit && node --experimental-strip-types --test tests/*.test.ts",

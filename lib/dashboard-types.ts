@@ -16,6 +16,9 @@ export interface DashboardThread {
 export interface GitEnvironment {
   projectId: string;
   id: string;
+  hostId: string;
+  path: string | null;
+  headSha: string | null;
   name: string | null;
   isWorktree: boolean;
   branchName: string | null;
